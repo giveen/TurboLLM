@@ -35,6 +35,26 @@ test('a leftover temp file from a killed flush does not affect the loaded snapsh
   again.close()
 })
 
+test('foreign_keys from a combined PRAGMA string is applied and survives a flush', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  const db = openSqlJsDatabaseSync(join(tmpDir('turbollm-sqljs-'), 'chat.db'))
+  // The exact string ConversationStore's migrate() runs (chat/db.ts).
+  db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;`)
+  db.exec(`CREATE TABLE p (id TEXT PRIMARY KEY);
+    CREATE TABLE c (id TEXT, p_id TEXT REFERENCES p(id) ON DELETE CASCADE);`)
+  db.prepare(`INSERT INTO p (id) VALUES ('a'), ('b')`).run()
+  db.prepare(`INSERT INTO c (id, p_id) VALUES ('1', 'a'), ('2', 'b')`).run()
+
+  db.prepare(`DELETE FROM p WHERE id = 'a'`).run()
+  assert.deepEqual(db.prepare('SELECT id FROM c').all(), [{ id: '2' }], 'cascade before any flush')
+
+  t.mock.timers.tick(FLUSH_INTERVAL_MS) // export() resets connection PRAGMAs
+  assert.deepEqual(db.prepare('PRAGMA foreign_keys').get(), { foreign_keys: 1 })
+  db.prepare(`DELETE FROM p WHERE id = 'b'`).run()
+  assert.deepEqual(db.prepare('SELECT id FROM c').all(), [], 'cascade still fires after a flush')
+  db.close()
+})
+
 test('the periodic flush writes only when something changed', (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const path = join(tmpDir('turbollm-sqljs-'), 'chat.db')

@@ -8,8 +8,9 @@
 //     assume ever happens. Each flush replaces the file atomically (temp + rename), so a
 //     kill mid-flush costs that interval's writes, never the whole file.
 //   • No WAL journal mode / busy_timeout — meaningless for an in-process, single-connection,
-//     single-threaded WASM database; both PRAGMAs are silently accepted as no-ops so
+//     single-threaded WASM database; both PRAGMAs are stripped out of exec() as no-ops so
 //     ConversationStore's migrate() doesn't need an Android-specific branch of its own.
+//     foreign_keys is kept, and re-applied after every export() (which resets it).
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import initSqlJs, { type Database as SqlJsDb, type SqlJsStatic } from 'sql.js'
 import type { SqlDb, SqlStatement, SqlValue } from './sqlite-adapter.js'
@@ -74,9 +75,10 @@ class SqlJsAdapter implements SqlDb {
     if (this.closed || !this.dirty) return
     const tmp = `${this.path}.tmp`
     try {
+      const bytes = this.exportPreservingForeignKeys()
       const fd = openSync(tmp, 'w')
       try {
-        writeFileSync(fd, this.db.export()) // loops on short writes; a bare writeSync doesn't
+        writeFileSync(fd, bytes) // loops on short writes; a bare writeSync doesn't
         fsyncSync(fd)
       } finally {
         closeSync(fd)
@@ -89,10 +91,25 @@ class SqlJsAdapter implements SqlDb {
     }
   }
 
+  /** sql.js's export() closes and reopens the underlying connection, which resets
+   *  connection-scoped PRAGMAs — foreign_keys drops back to OFF, silently disabling the
+   *  schema's ON DELETE CASCADEs after the first flush. Restore it if it was on. */
+  private exportPreservingForeignKeys(): Uint8Array {
+    const fkOn = this.db.exec('PRAGMA foreign_keys')[0]?.values[0]?.[0] === 1
+    try {
+      return this.db.export()
+    } finally {
+      if (fkOn) this.db.exec('PRAGMA foreign_keys = ON')
+    }
+  }
+
   exec(sql: string): void {
-    const trimmed = sql.trim().toLowerCase()
-    if (trimmed.startsWith('pragma journal_mode') || trimmed.startsWith('pragma busy_timeout')) return
-    this.db.exec(sql)
+    // Drop only the unsupported PRAGMA statements, not the whole string: ConversationStore's
+    // `PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = …` would
+    // otherwise lose its foreign_keys statement along with them.
+    const rest = sql.replace(/\bpragma\s+(?:journal_mode|busy_timeout)\b[^;]*;?/gi, '').trim()
+    if (!rest) return
+    this.db.exec(rest)
     this.dirty = true
   }
 
