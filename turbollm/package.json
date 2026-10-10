@@ -74,7 +74,10 @@
     "typescript": "^5.7.0"
   },
   "overrides": {
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "@earendil-works/pi-coding-agent": {
+      "undici": "8.11.2"
+    }
   },
   "engines": {
     "node": ">=22.13.0"
