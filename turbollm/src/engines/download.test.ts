@@ -1,6 +1,6 @@
 // Tests for scoreAsset and pickReleaseAsset (ADR-044).
-// These cover the asset-matching logic for all supported platforms / arches,
-// used by turboquantAssetUrl to pick the right release asset per OS.
+// These cover the generic asset-matching logic for all supported platforms / arches.
+// TurboQuant's resolver matches exact asset names instead (download.turboquant.test.ts).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {

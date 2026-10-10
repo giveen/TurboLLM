@@ -16,6 +16,7 @@
 
 import type { Engine } from '../config/config'
 import { type BackendId, GithubRateLimitError, latestBuildTagRelease, latestCommitSha, latestReleaseTag } from './download'
+import { detectTurboquantHw, fetchTurboquantRelease } from './download'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -187,6 +188,35 @@ export function tagFromVersionString(version: string): string {
   return m ? m[0] : ''
 }
 
+/** The installed TurboQuant release from its probed version string. Release builds print
+ *  their tag ("version: b10298-2.0.0 (build 11426, commit cda0f9256)") → `b10298-2.0.0`.
+ *  Builds from the fork's earlier per-platform releases print only a commit ("version: 1
+ *  (519f0c5)") → that short hash, which {@link compareTurboquantTags} treats as older than
+ *  any tagged release. '' when neither is present. */
+export function turboquantInstalledTag(version: string): string {
+  const tag = /\bb\d+-\d+(?:\.\d+)+\b/i.exec(version)
+  if (tag) return tag[0]
+  const sha = /\(([0-9a-f]{7,40})\)/i.exec(version)
+  return sha ? sha[1] : ''
+}
+
+/** Compare TurboQuant release tags (`b<upstream build>-<semver>`). The semver is the fork's
+ *  own version and decides first — several releases share one upstream build (b10269-1.5.0
+ *  … b10269-1.7.0); the build number breaks a tie. An installed commit hash (a pre-tag build,
+ *  see {@link turboquantInstalledTag}) is behind any tagged release. */
+export function compareTurboquantTags(installed: string, latest: string): CompareResult {
+  const re = /^b(\d+)-(\d+(?:\.\d+)*)$/i
+  const a = re.exec(installed.trim())
+  const b = re.exec(latest.trim())
+  if (!b) return 'unknown'
+  if (!a) return /^[0-9a-f]{7,40}$/i.test(installed.trim()) ? 'newer' : 'unknown'
+  const bySemver = comparePipVersions(a[2], b[2])
+  if (bySemver !== 'equal') return bySemver
+  const x = Number(a[1])
+  const y = Number(b[1])
+  return x === y ? 'equal' : x < y ? 'newer' : 'older'
+}
+
 /** Extract `owner/repo` from a GitHub repo URL (ADR-088), tolerating a `.git` suffix,
  *  a trailing slash, and `http(s)://`/`www.`/bare `github.com/` forms. Returns null when
  *  the URL isn't a recognizable GitHub repo URL. PURE — the source-mode update resolver
@@ -256,7 +286,7 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
       return { source: 'github-release', ref: OFFICIAL_LLAMA_REPO, installed: tagFromManagedBinPath(engine.binPath) }
     }
     if (isTurboquant(engine.binPath)) {
-      return { source: 'github-release', ref: TURBOQUANT_REPO, installed: tagFromVersionString(engine.version) }
+      return { source: 'github-release', ref: TURBOQUANT_REPO, installed: turboquantInstalledTag(engine.version) }
     }
   }
   // User-added arbitrary binaries: no honest upstream to compare against.
@@ -297,6 +327,11 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   }
   // Source-built engines (ADR-088): the repo's latest commit sha on the branch.
   if (src.source === 'source') return latestCommitSha(src.ref, src.branch ?? '', signal)
+  // TurboQuant: the same resolver the install/apply uses (newest release with a build for THIS
+  // machine), not `releases/latest` — otherwise the two can disagree and the update repeats.
+  if (src.ref === TURBOQUANT_REPO) {
+    return (await fetchTurboquantRelease(src.ref, await detectTurboquantHw(), signal))?.tag ?? ''
+  }
   // When the INSTALLED version is a llama.cpp-style build tag, resolve the newest build-tag
   // release rather than GitHub's `releases/latest`. llama.cpp publishes both `b#####` per-build
   // tags and occasional semver releases (`v0.4.0`), and marks the semver one as "latest" — so
@@ -349,7 +384,9 @@ export async function computeUpdateStatus(
       rebuild: true,
     }
   }
-  const cmp = compareVersions(src.source, src.installed, latest)
+  const cmp = src.ref === TURBOQUANT_REPO
+    ? compareTurboquantTags(src.installed, latest)
+    : compareVersions(src.source, src.installed, latest)
   return {
     installed: src.installed,
     latest,

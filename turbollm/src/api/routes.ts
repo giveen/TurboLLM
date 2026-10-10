@@ -1037,10 +1037,10 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // Provision a catalog fork via GitHub release (ADR-044) — TurboQuant. Downloads
-  // the platform-matching prebuilt llama-server, probes it (it IS llama-server
-  // compatible), and registers it as a kind='llama-server' engine. 202 + progress
-  // via /status. The fork currently ships macOS prebuilts only, so the install is
-  // platform-guarded to where an asset actually exists (matches the OS prefilter).
+  // the prebuilt llama-server matching this OS/arch/GPU (CUDA on NVIDIA; see download.ts
+  // turboquantCandidates), probes it (it IS llama-server compatible), and registers it
+  // as a kind='llama-server' engine. 202 + progress via /status. Hardware with no
+  // prebuilt fails with no_release_asset (→ build from source).
   // ?update=1 removes the existing install dir so the latest release is re-downloaded.
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
@@ -1059,7 +1059,6 @@ export function registerApi(app: Hono, d: Deps): void {
           const tqDir = join(root, 'turboquant')
           if (existsSync(tqDir)) rmSync(tqDir, { recursive: true, force: true })
         }
-        // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
         const bin = await provisionTurboquant(root, entry.repo!, (p) =>
           d.provision.progress(p.phase, p.pct, p.part, p.parts),
         )
@@ -1070,7 +1069,7 @@ export function registerApi(app: Hono, d: Deps): void {
       } catch (e) {
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
-            ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
+            ? 'TurboQuant has no prebuilt binary for this system. Build llama-server from the fork, then use "Add your own engine".'
             : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
       }

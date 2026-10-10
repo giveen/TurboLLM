@@ -6,11 +6,14 @@
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
 import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
-import type { GpuVendor } from '../sysinfo/sysinfo'
+import { getSysInfo, primaryVendor, type GpuVendor } from '../sysinfo/sysinfo'
+// cuda-provision imports this module back (downloadFile/extractArchive); both sides only call
+// each other from inside functions, never at module load, so the cycle is safe.
+import { driverMaxCuda, nvidiaComputeCaps } from './cuda-provision'
 
 const execFileP = promisify(execFile)
 
@@ -541,6 +544,8 @@ export function pickReleaseAsset(
 /** One GitHub release as we consume it (latest-release resolution). */
 export interface GithubRelease {
   tag_name?: string
+  draft?: boolean
+  prerelease?: boolean
   assets?: ReleaseAsset[]
 }
 
@@ -651,77 +656,215 @@ export async function latestCommitSha(repo: string, branch = '', signal?: AbortS
 }
 
 
-// TurboQuant ships self-contained prebuilts for macOS-arm64 and Linux-x64 (Vulkan) as
-// GitHub releases tagged PER PLATFORM (turboquant-macos-arm64-*, turboquant-linux-x64-*)
-// — so `releases/latest` can't be used (it's whichever platform published most recently);
-// this resolver finds the newest release whose TAG matches the OS. Windows has no usable
-// self-contained prebuilt (the only one, on HuggingFace, is a MinGW build with a UCRT
-// linkage defect that won't load), so it returns null → "build from source".
+// TurboQuant (AtomicBot-ai/atomic-llama-cpp-turboquant) publishes one release per version,
+// tagged `b<upstream build>-<semver>` (e.g. `b10298-2.0.0`), carrying every platform/backend
+// as `llama-turboquant-<os>-<arch>[-<backend>].{tar.gz,zip}`. Until mid-2026 it instead cut one
+// release PER PLATFORM (`turboquant-linux-x64-vulkan-<sha>`) with the same asset names, so the
+// resolver matches on asset NAMES, never on tag shape: the newest release that has any asset
+// this machine can run wins, and the old per-platform releases still resolve as a fallback.
+// `dev-latest` is a rolling prerelease and is skipped.
 
-/** Resolve the TurboQuant archive URL for this platform, or null when no self-contained
- *  prebuilt exists (→ caller falls back to "build from source"). macOS/Linux → the newest
- *  GitHub release whose TAG names this OS and carries a matching asset; Windows → null. */
-export async function turboquantAssetUrl(
-  repo: string,
-  platform = process.platform,
-  archStr = process.arch,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  if (platform === 'win32') return null // no usable self-contained Windows prebuilt
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
-    headers: githubHeaders(),
-    signal,
-  })
-  if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
-  const releases = (await res.json()) as GithubRelease[]
-  const osTag = platform === 'darwin' ? 'macos' : 'linux'
+/** What the TurboQuant variant choice depends on. `driverCuda` is the NVIDIA driver's max
+ *  CUDA version from nvidia-smi ("13.4"), or null when it can't be read; `computeCaps` the
+ *  compute capability of each NVIDIA GPU ([12.0] for an RTX 5090), [] when unknown. */
+export interface TurboquantHw {
+  platform: string
+  arch: string
+  vendor: GpuVendor
+  hasGpu: boolean
+  driverCuda: string | null
+  computeCaps: number[]
+}
+
+/** One installable TurboQuant build: `name` is the asset stem after `llama-turboquant-`.
+ *  `cudartPack` names an official llama.cpp runtime archive that must be extracted beside the
+ *  binary — the fork's Windows CUDA 13.3 zip ships ggml-cuda.dll without cudart64_13 /
+ *  cublas64_13 / cublasLt64_13 (its CUDA 12.4 zip and every Linux CUDA archive bundle them). */
+export interface TurboquantVariant {
+  name: string
+  cudartPack?: string
+}
+
+const TQ_WIN_CUDA13_RUNTIME = 'cudart-llama-bin-win-cuda-13.3-x64.zip'
+
+/** "13.4" ≥ "13.0"? Numeric major.minor compare; false for null/garbage. */
+function cudaAtLeast(have: string | null, want: string): boolean {
+  if (!have) return false
+  const [hm, hn] = have.split('.').map(Number)
+  const [wm, wn] = want.split('.').map(Number)
+  if (!Number.isFinite(hm)) return false
+  return hm !== wm ? hm > wm : (hn || 0) >= (wn || 0)
+}
+
+/** PURE: the TurboQuant builds this machine can run, best first. NVIDIA gets CUDA, gated on
+ *  both the driver and the GPUs' compute capability:
+ *   - the 13.3 build needs a CUDA 13 driver, and CUDA 13 dropped GPUs older than Turing (< 7.5);
+ *   - the 12.4 build has no Blackwell kernels (≥ 10.0) — measured: it detects an RTX 5090,
+ *     then aborts with a CUDA error in the first flash-attention launch.
+ *  Unknown compute capabilities ([]) gate on the driver alone. With no usable CUDA build
+ *  (old driver, unreadable nvidia-smi, or a mix of very old and very new GPUs) → Vulkan.
+ *  AMD, Intel and other GPUs get Vulkan (the fork's ROCm archive relies on a system ROCm
+ *  install we can't verify); no GPU gets the CPU build. Empty → no prebuilt for this platform
+ *  (→ build from source). */
+export function turboquantCandidates(hw: TurboquantHw): TurboquantVariant[] {
+  const arch = hw.arch === 'arm64' ? 'arm64' : 'x64'
+  if (hw.platform === 'darwin') return arch === 'arm64' ? [{ name: 'macos-arm64' }] : []
+  const os = hw.platform === 'win32' ? 'windows' : hw.platform === 'linux' ? 'linux' : null
+  if (!os) return []
+  const out: TurboquantVariant[] = []
+  if (hw.vendor === 'nvidia') {
+    const caps = hw.computeCaps
+    const cuda13Gpus = caps.every((c) => c >= 7.5)
+    const cuda12Gpus = caps.every((c) => c < 10)
+    if (cuda13Gpus && cudaAtLeast(hw.driverCuda, '13.0')) {
+      out.push(os === 'windows'
+        ? { name: `windows-${arch}-cuda-13.3`, cudartPack: TQ_WIN_CUDA13_RUNTIME }
+        : { name: `linux-${arch}-cuda-13.3` })
+    }
+    if (arch === 'x64' && cuda12Gpus && cudaAtLeast(hw.driverCuda, '12.4')) out.push({ name: `${os}-x64-cuda-12.4` })
+  }
+  // The fork only ships CUDA 12.4/Vulkan/CPU builds for x64; arm64 Linux has CUDA 13.3 only.
+  if (arch === 'x64') out.push(hw.hasGpu ? { name: `${os}-x64-vulkan` } : { name: `${os}-x64-cpu` })
+  return out
+}
+
+export interface TurboquantResolution {
+  tag: string
+  variant: TurboquantVariant
+  assetName: string
+  url: string
+}
+
+/** PURE: the newest non-draft, non-prerelease release (API order is newest-first) carrying any
+ *  of `candidates`, and the best candidate within it. Prefers .zip on Windows, .tar.gz elsewhere
+ *  (the fork publishes both for Linux; extractArchive handles either). */
+export function resolveTurboquantRelease(
+  releases: GithubRelease[],
+  candidates: TurboquantVariant[],
+  platform: string,
+): TurboquantResolution | null {
+  const exts = platform === 'win32' ? ['.zip', '.tar.gz'] : ['.tar.gz', '.zip']
   for (const rel of releases) {
-    if (!(rel.tag_name ?? '').toLowerCase().includes(osTag)) continue
-    const asset = pickReleaseAsset(rel.assets ?? [], platform, archStr)
-    if (asset) return asset.browser_download_url
+    if (rel.draft || rel.prerelease || !rel.tag_name) continue
+    for (const variant of candidates) {
+      for (const ext of exts) {
+        const assetName = `llama-turboquant-${variant.name}${ext}`
+        const asset = rel.assets?.find((a) => a.name === assetName)
+        if (asset) return { tag: rel.tag_name, variant, assetName, url: asset.browser_download_url }
+      }
+    }
   }
   return null
 }
 
-/** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`,
- *  resolving the right per-platform source (HF on Windows, GitHub elsewhere) via the
- *  download → extract → locate pipeline. Throws `no_release_asset` when this platform
- *  has no prebuilt. */
+/** This machine's {@link TurboquantHw}. nvidia-smi only runs when an NVIDIA GPU is present. */
+export async function detectTurboquantHw(): Promise<TurboquantHw> {
+  const info = getSysInfo()
+  const vendor = primaryVendor(info)
+  let driverCuda: string | null = null
+  let computeCaps: number[] = []
+  if (vendor === 'nvidia') [driverCuda, computeCaps] = await Promise.all([driverMaxCuda(), nvidiaComputeCaps()])
+  return { platform: process.platform, arch: process.arch, vendor, hasGpu: info.gpus.length > 0, driverCuda, computeCaps }
+}
+
+/** Resolve the TurboQuant release + asset for `hw`, or null when none fits. Shared by the
+ *  install, the update apply AND the update check, so the check can never offer a tag the
+ *  apply wouldn't install (see latestTagForInstalled for how that once went wrong). */
+export async function fetchTurboquantRelease(
+  repo: string,
+  hw: TurboquantHw,
+  signal?: AbortSignal,
+): Promise<TurboquantResolution | null> {
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
+    headers: githubHeaders(),
+    signal,
+  })
+  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
+  if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
+  return resolveTurboquantRelease((await res.json()) as GithubRelease[], turboquantCandidates(hw), hw.platform)
+}
+
+/** True when `dir` holds a CUDA backend without its runtime beside it — what an install
+ *  interrupted between the Windows CUDA 13.3 binary and its runtime pack leaves behind. Run
+ *  like that, ggml can't load the CUDA backend and silently falls back to CPU. */
+function cudaRuntimeMissing(dir: string): boolean {
+  try {
+    const files = readdirSync(dir)
+    const hasCudaBackend = files.some((f) => /^(?:lib)?ggml-cuda\.(?:dll|so)$/i.test(f))
+    const hasRuntime = files.some((f) => /^cudart64_\d+\.dll$|^libcudart\.so/i.test(f))
+    return hasCudaBackend && !hasRuntime
+  } catch {
+    return false
+  }
+}
+
+/** The installed TurboQuant server under `destDir`, or null when absent or incomplete. A
+ *  marker-less dir (installed before the marker existed) counts unless its CUDA runtime is
+ *  missing; the marker is backfilled so this is derived once. */
+function installedTurboquant(destDir: string): string | null {
+  const bin = findServer(destDir)
+  if (!bin) return null
+  if (existsSync(join(destDir, PROVISION_MARKER))) return bin
+  if (cudaRuntimeMissing(dirname(bin))) return null
+  try { writeFileSync(join(destDir, PROVISION_MARKER), JSON.stringify({ backfilled: true })) } catch { /* re-derived next time */ }
+  return bin
+}
+
+/** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`: resolve
+ *  the release + variant for this machine, download → extract (plus the CUDA runtime pack
+ *  when the variant needs one) → locate. Throws `no_release_asset` when no prebuilt fits. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  hw?: TurboquantHw,
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
-  if (existsSync(destDir)) {
-    const found = findServer(destDir)
-    if (found) {
-      // Strip quarantine even on the fast-path: a previous failed probe leaves the
-      // directory intact with the quarantine attribute still set.
-      stripMacOsQuarantine(destDir)
-      return found
-    }
+  const existing = installedTurboquant(destDir)
+  if (existing) {
+    // Strip quarantine even on the fast-path: a previous failed probe leaves the
+    // directory intact with the quarantine attribute still set.
+    stripMacOsQuarantine(destDir)
+    return existing
   }
-  const url = await turboquantAssetUrl(repo, process.platform, process.arch, signal)
-  if (!url) throw new Error('no_release_asset')
+  rmSync(destDir, { recursive: true, force: true }) // an incomplete earlier install
+
+  const resolved = await fetchTurboquantRelease(repo, hw ?? (await detectTurboquantHw()), signal)
+  if (!resolved) throw new Error('no_release_asset')
+  const { variant } = resolved
+  const archives = [{ name: resolved.assetName, url: resolved.url }]
+  if (variant.cudartPack) {
+    archives.push({
+      name: variant.cudartPack,
+      url: `https://github.com/${REPO}/releases/download/${LLAMA_BUILD}/${variant.cudartPack}`,
+    })
+  }
 
   mkdirSync(destDir, { recursive: true })
-  const fname = url.split('/').pop()?.split('?')[0] || 'turboquant-download.zip'
-  const tmp = join(enginesRoot, fname)
+  const parts = archives.length
+  const tmpPaths: string[] = []
   try {
-    onProgress?.({ phase: 'downloading', pct: 0 })
-    await downloadFile(url, tmp, onProgress, signal)
-    onProgress?.({ phase: 'extracting', pct: -1 })
-    await extractArchive(tmp, destDir)
-    rmSync(tmp, { force: true })
+    for (const [i, archive] of archives.entries()) {
+      const part = i + 1
+      const tmp = join(enginesRoot, archive.name)
+      tmpPaths.push(tmp)
+      onProgress?.({ phase: 'downloading', pct: 0, part, parts })
+      await downloadFile(archive.url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal)
+      onProgress?.({ phase: 'extracting', pct: -1, part, parts })
+      // The runtime pack's DLLs sit at its root; Windows only searches the exe's own dir.
+      const bin = i === 0 ? null : findServer(destDir)
+      await extractArchive(tmp, bin ? dirname(bin) : destDir)
+      rmSync(tmp, { force: true })
+    }
   } catch (e) {
-    rmSync(tmp, { force: true })
+    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
     rmSync(destDir, { recursive: true, force: true })
     throw e
   }
 
   const bin = findServer(destDir)
   if (!bin) throw new Error('llama-server not found in extracted TurboQuant archive')
+  writeFileSync(join(destDir, PROVISION_MARKER), JSON.stringify({ tag: resolved.tag, assets: archives.map((a) => a.name) }))
   return bin
 }
