@@ -1062,8 +1062,7 @@ export function registerApi(app: Hono, d: Deps): void {
         const bin = await provisionTurboquant(root, entry.repo!, (p) =>
           d.provision.progress(p.phase, p.pct, p.part, p.parts),
         )
-        let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-        if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
+        const eng = await d.registry.addOrReprobe('TurboQuant', bin)
         d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
