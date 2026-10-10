@@ -26,8 +26,16 @@ export default defineConfig({
   // nodejs-mobile embeds Node **18.20.4**, not the 22 the desktop package targets. Building
   // this pass for node22 would emit syntax the phone's runtime cannot parse.
   target: 'node18',
-  // Bundle everything by default — the whole point of this pass.
-  noExternal: [/.*/],
+  // Bundle everything by default — the whole point of this pass. tsup checks `noExternal`
+  // BEFORE `external`, so this catch-all wins over the `external` list below; the one module
+  // that must genuinely stay out is excluded here, by lookahead, instead.
+  //
+  // puppeteer-core: server-side artifact screenshots need an installed desktop Chrome, which a
+  // phone never has — findChrome() returns null and screenshotArtifact() bails before its
+  // dynamic import. Bundling it anyway drags in @puppeteer/browsers' yargs, whose ESM shim
+  // declares its own `__dirname` and collides with the banner's (a SyntaxError chunk). Left
+  // out, the import (if ever reached) just fails and the existing catch returns null.
+  noExternal: [/^(?!puppeteer-core(\/|$)).*/],
   // Bundling CommonJS packages into an ESM output leaves esbuild's `__require` shim in place,
   // and that shim THROWS for any require it could not resolve statically. undici does
   // `require('assert')` at load time, which crashed the app on first boot with:
@@ -66,5 +74,7 @@ export default defineConfig({
     // must not be dragged in here even accidentally.
     '@earendil-works/pi-ai',
     '@earendil-works/pi-coding-agent',
+    // Effective via the `noExternal` lookahead above; listed here for completeness.
+    'puppeteer-core',
   ],
 })

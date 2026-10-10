@@ -54,7 +54,7 @@
     "@xterm/xterm": "^6.0.0",
     "diff": "^9.0.0",
     "hono": "^4.6.0",
-    "puppeteer-core": "^23.11.1",
+    "puppeteer-core": "^25.13.0",
     "sql.js": "^1.14.1",
     "typebox": "1.1.38",
     "undici": "^7.28.0",
