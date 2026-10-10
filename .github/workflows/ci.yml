@@ -32,6 +32,37 @@ jobs:
         run: npm test
         working-directory: turbollm
 
+  web:
+    name: Web build & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            turbollm/package-lock.json
+            turbollm/web/package-lock.json
+
+      # web/'s tsconfig resolves @types/node from turbollm/node_modules (web/ declares
+      # none itself), exactly as the release builds run it — so install turbollm first.
+      - name: Install daemon dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: turbollm/web
+
+      - name: Typecheck & build
+        run: npm run build
+        working-directory: turbollm/web
+
+      - name: Unit tests
+        run: npm test
+        working-directory: turbollm/web
+
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}
