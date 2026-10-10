@@ -5,11 +5,12 @@
 //     non-graceful kill (routine on Android — the OS can kill an app any time) loses writes
 //     since the last flush, not since the last close — periodic flush (below) bounds that
 //     window instead of only flushing at a clean shutdown, which chat data on Android can't
-//     assume ever happens.
+//     assume ever happens. Each flush replaces the file atomically (temp + rename), so a
+//     kill mid-flush costs that interval's writes, never the whole file.
 //   • No WAL journal mode / busy_timeout — meaningless for an in-process, single-connection,
 //     single-threaded WASM database; both PRAGMAs are silently accepted as no-ops so
 //     ConversationStore's migrate() doesn't need an Android-specific branch of its own.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import initSqlJs, { type Database as SqlJsDb, type SqlJsStatic } from 'sql.js'
 import type { SqlDb, SqlStatement, SqlValue } from './sqlite-adapter.js'
 
@@ -57,18 +58,34 @@ function bindArgs(params: (SqlValue | Record<string, SqlValue>)[]): Record<strin
 class SqlJsAdapter implements SqlDb {
   private readonly flushTimer: ReturnType<typeof setInterval>
   private closed = false
+  // Set by anything that may have written; cleared only by a successful flush, so an idle
+  // daemon doesn't rewrite the whole file every interval and a failed flush is retried.
+  private dirty = false
 
   constructor(private readonly db: SqlJsDb, private readonly path: string) {
     this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS)
     this.flushTimer.unref?.()
   }
 
+  /** Writes the snapshot to a sibling temp file, fsyncs it, then renames it over `path`, so
+   *  a kill mid-write leaves the previous snapshot intact instead of a truncated file (which
+   *  would fail to load and lose every conversation, not just the last interval's writes). */
   private flush(): void {
-    if (this.closed) return
+    if (this.closed || !this.dirty) return
+    const tmp = `${this.path}.tmp`
     try {
-      writeFileSync(this.path, Buffer.from(this.db.export()))
+      const fd = openSync(tmp, 'w')
+      try {
+        writeFileSync(fd, this.db.export()) // loops on short writes; a bare writeSync doesn't
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(tmp, this.path)
+      this.dirty = false
     } catch {
-      // Best-effort — the in-memory DB stays usable even if a flush fails (e.g. disk full).
+      // Best-effort — the in-memory DB stays usable even if a flush fails (e.g. disk full);
+      // `dirty` stays set so the next interval retries.
     }
   }
 
@@ -76,12 +93,18 @@ class SqlJsAdapter implements SqlDb {
     const trimmed = sql.trim().toLowerCase()
     if (trimmed.startsWith('pragma journal_mode') || trimmed.startsWith('pragma busy_timeout')) return
     this.db.exec(sql)
+    this.dirty = true
   }
 
   prepare(sql: string): SqlStatement {
     const db = this.db
+    const markDirty = () => { this.dirty = true }
+    // get()/all() are reads everywhere today, but a statement that isn't a plain SELECT
+    // (e.g. a future INSERT … RETURNING) must still be flushed.
+    const mayWrite = !/^\s*select\b/i.test(sql)
     return {
       get(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        if (mayWrite) markDirty()
         const stmt = db.prepare(sql)
         try {
           const bound = bindArgs(params)
@@ -95,6 +118,7 @@ class SqlJsAdapter implements SqlDb {
         }
       },
       all(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        if (mayWrite) markDirty()
         const stmt = db.prepare(sql)
         const rows: Record<string, unknown>[] = []
         try {
@@ -107,6 +131,7 @@ class SqlJsAdapter implements SqlDb {
         return rows
       },
       run(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        markDirty()
         const stmt = db.prepare(sql)
         try {
           const bound = bindArgs(params)
@@ -122,9 +147,9 @@ class SqlJsAdapter implements SqlDb {
 
   close(): void {
     if (this.closed) return
-    this.closed = true
     clearInterval(this.flushTimer)
-    this.flush()
+    this.flush() // before `closed` is set — flush() is a no-op once it is
+    this.closed = true
     this.db.close()
   }
 }
