@@ -27,8 +27,9 @@ export default defineConfig({
   // this pass for node22 would emit syntax the phone's runtime cannot parse.
   target: 'node18',
   // Bundle everything by default — the whole point of this pass. tsup checks `noExternal`
-  // BEFORE `external`, so this catch-all wins over the `external` list below; the one module
-  // that must genuinely stay out is excluded here, by lookahead, instead.
+  // BEFORE `external`, so this catch-all wins over every package in the `external` list below
+  // (see the note there). A package that must stay out of the bundle has to be excluded HERE,
+  // by lookahead, as puppeteer-core is.
   //
   // puppeteer-core: server-side artifact screenshots need an installed desktop Chrome, which a
   // phone never has — findChrome() returns null and screenshotArtifact() bails before its
@@ -60,6 +61,12 @@ export default defineConfig({
       'const __dirname = __tllmDirname(__filename);',
     ].join('\n'),
   },
+  // NOTE: the `noExternal` catch-all above takes precedence, so the package entries in this
+  // list do NOT keep anything out of the bundle (verified: sql.js is inlined into the
+  // sql-js-database chunk). `node:sqlite` stays external only because esbuild never bundles
+  // builtins on platform 'node'. The pi-* packages are absent from the output only because
+  // nothing the Android entry reaches imports them — if that ever changes, they WILL be
+  // bundled unless added to the `noExternal` lookahead.
   external: [
     // Built into Node 22 but ABSENT from the phone's Node 18 — sqlite-adapter.ts already
     // falls back to sql.js there. Left external so the `node:` specifier survives for the
@@ -74,7 +81,7 @@ export default defineConfig({
     // must not be dragged in here even accidentally.
     '@earendil-works/pi-ai',
     '@earendil-works/pi-coding-agent',
-    // Effective via the `noExternal` lookahead above; listed here for completeness.
+    // Actually kept out by the `noExternal` lookahead above; listed here for completeness.
     'puppeteer-core',
   ],
 })
