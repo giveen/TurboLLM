@@ -32,6 +32,40 @@ jobs:
         run: npm test
         working-directory: turbollm
 
+  # Windows parity. The engine installers take a different branch on Windows (PowerShell
+  # Expand-Archive instead of tar, `llama-server.exe`, a separate CUDA runtime pack), and until
+  # this job existed none of that had ever been executed by CI — the win32-only tests were
+  # simply skipped on the ubuntu runner, which is how a Windows-only regression reached review.
+  #
+  # continue-on-error: the suite has only ever run on Linux; landing it non-blocking first means
+  # it can be seen green (and any platform-specific failures fixed) before it gates PRs. Remove
+  # this line once the job is reliably green.
+  test-windows:
+    name: Typecheck & Unit tests (Windows)
+    runs-on: windows-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: turbollm
+
+      - name: Unit tests
+        run: npm test
+        working-directory: turbollm
+
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}
