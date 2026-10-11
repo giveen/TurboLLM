@@ -81,7 +81,5 @@ export default defineConfig({
     // must not be dragged in here even accidentally.
     '@earendil-works/pi-ai',
     '@earendil-works/pi-coding-agent',
-    // Actually kept out by the `noExternal` lookahead above; listed here for completeness.
-    'puppeteer-core',
   ],
 })
