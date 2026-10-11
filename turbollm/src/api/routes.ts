@@ -1038,10 +1038,12 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Provision a catalog fork via GitHub release (ADR-044) — TurboQuant. Downloads
   // the prebuilt llama-server matching this OS/arch/GPU (CUDA on NVIDIA; see download.ts
-  // turboquantCandidates), probes it (it IS llama-server compatible), and registers it
-  // as a kind='llama-server' engine. 202 + progress via /status. Hardware with no
-  // prebuilt fails with no_release_asset (→ build from source).
-  // ?update=1 removes the existing install dir so the latest release is re-downloaded.
+  // turboquantCandidates), verifies the backend it promised actually loads (retrying the next
+  // candidate if not), probes it (it IS llama-server compatible), and registers it as a
+  // kind='llama-server' engine. 202 + progress via /status. Hardware with no prebuilt fails
+  // with no_release_asset (→ build from source).
+  // ?update=1 re-installs the latest release over the existing build (the removal happens
+  // inside provisionTurboquant, only after its release lookup succeeds).
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
     if (!entry?.repo) return err(c, 500, 'internal', 'TurboQuant catalog entry is misconfigured.')
@@ -1054,14 +1056,9 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
-        // For update: remove existing dir so provisionTurboquant re-downloads the latest.
-        if (upgrade) {
-          const tqDir = join(root, 'turboquant')
-          if (existsSync(tqDir)) rmSync(tqDir, { recursive: true, force: true })
-        }
         const bin = await provisionTurboquant(root, entry.repo!, (p) =>
           d.provision.progress(p.phase, p.pct, p.part, p.parts),
-        )
+        undefined, undefined, upgrade)
         const eng = await d.registry.addOrReprobe('TurboQuant', bin)
         d.registry.activate(eng.id)
         d.provision.done()

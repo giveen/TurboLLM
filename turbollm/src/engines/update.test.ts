@@ -344,6 +344,22 @@ test('computeUpdateStatus: a non-rate-limit failure still reports offline', asyn
   assert.equal(st.error, 'offline')
 })
 
+test('fetchLatest: a TurboQuant release with no build for this machine reports no_release_asset, NOT offline', async (t) => {
+  // Regression: the resolver returned '' when nothing fit, and computeUpdateStatus reported an
+  // empty latest as 'offline' — telling the user their connection was broken when the real
+  // answer was that the fork has no prebuilt for their hardware.
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async () => new Response('[]', { status: 200 })) as typeof fetch
+
+  const e = eng({ binPath: '/root/engines/turboquant/build/bin/llama-server', version: 'b10298-2.0.0 (build 11426, commit cda0f9256)' })
+  const st = await computeUpdateStatus(e)
+  assert.equal(st.error, 'no_release_asset')
+  assert.equal(st.latest, null)
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, false)
+})
+
 test('computeUpdateStatus: empty latest treated as offline (no false up-to-date)', async () => {
   const e = eng({ kind: 'vllm', version: 'vllm 0.11.2' })
   const st = await computeUpdateStatus(e, async () => '')

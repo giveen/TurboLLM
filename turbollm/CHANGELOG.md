@@ -23,7 +23,27 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **TurboQuant installs no longer keep a build that can't use the GPU.** A build that downloaded and
+  unpacked correctly but whose GPU backend then failed to load (the Windows CUDA 13.3 archive ships no
+  CUDA runtime; an old driver has no kernels for the CUDA 12.4 build) used to be recorded as installed
+  and then silently ran on the CPU. TurboLLM now asks the binary which devices it actually sees after
+  installing, and moves on to the next build for that machine (CUDA 13.3 → CUDA 12.4 → Vulkan) when the
+  GPU backend it promised is missing.
+- **TurboQuant update check can no longer offer an older release than the one installed.** The newest
+  release is now chosen by version rather than by the order GitHub lists releases in, so a patch cut for
+  an older line is no longer picked for fresh installs and updates.
+- **A failed TurboQuant download or release lookup leaves the working engine in place.** The install
+  directory used to be removed before the release was even resolved, so an offline or rate-limited
+  check uninstalled the engine; the removal now happens only once the release resolved.
+- **The TurboQuant install is re-probed after an update**, so the stored version changes and the update
+  isn't offered again forever.
+- **CUDA version detection on 600-series NVIDIA drivers.** They print `CUDA UMD Version: 13.4` rather
+  than `CUDA Version:`, which read as "no CUDA", which also affected CUDA toolkit auto-provisioning.
+- **TurboQuant downloads are verified against the sha256 GitHub publishes for the asset.**
+- **A TurboQuant build with no prebuilt for this machine says so**, instead of reporting the update
+  check as "offline".
 
 ## [1.14.5] - 2026-10-04
 

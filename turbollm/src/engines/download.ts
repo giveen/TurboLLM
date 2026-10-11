@@ -4,8 +4,9 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -14,6 +15,8 @@ import { getSysInfo, primaryVendor, type GpuVendor } from '../sysinfo/sysinfo'
 // cuda-provision imports this module back (downloadFile/extractArchive); both sides only call
 // each other from inside functions, never at module load, so the cycle is safe.
 import { driverMaxCuda, nvidiaComputeCaps } from './cuda-provision'
+// probe is a leaf module (it imports only config), so this direction can't cycle.
+import { listDevices } from './probe'
 
 const execFileP = promisify(execFile)
 
@@ -322,14 +325,17 @@ export async function downloadFile(
   dest: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  expectedSha256?: string,
 ): Promise<void> {
   const res = await fetch(url, { redirect: 'follow', signal })
   if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status}`)
   const total = Number(res.headers.get('content-length') ?? 0)
+  const hash = expectedSha256 ? createHash('sha256') : null
   let got = 0
   let lastPct = -1
   const body = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
   body.on('data', (chunk: Buffer) => {
+    hash?.update(chunk)
     got += chunk.length
     if (total && onProgress) {
       const pct = got / total
@@ -340,6 +346,12 @@ export async function downloadFile(
     }
   })
   await pipeline(body, createWriteStream(dest), { signal })
+  // Integrity, when the release publishes GitHub's own `sha256:` asset digest: a 530 MB engine
+  // archive is far too large to trust to a truncated-but-2xx response.
+  if (expectedSha256 && hash && hash.digest('hex') !== expectedSha256.toLowerCase()) {
+    rmSync(dest, { force: true })
+    throw new Error('checksum_failed: the downloaded archive did not match the published sha256')
+  }
 }
 
 /**
@@ -493,6 +505,9 @@ export function deleteAllBackendBuilds(enginesRoot: string, id: BackendId): numb
 export interface ReleaseAsset {
   name: string
   browser_download_url: string
+  /** GitHub's own `sha256:<hex>` for the asset, when the release publishes one (newer
+   *  releases do; older ones and other hosts leave it null). Verified by `downloadFile`. */
+  digest?: string | null
 }
 
 /** Score how well an asset name matches this OS/arch; -1 = no match (wrong OS/arch
@@ -560,6 +575,17 @@ export class GithubRateLimitError extends Error {
   constructor(repo: string) {
     super(`GitHub API rate limit exhausted while querying ${repo}`)
     this.name = 'GithubRateLimitError'
+  }
+}
+
+/** Thrown when a release lookup SUCCEEDED but nothing in it can run on this machine — the
+ *  distinct answer for "no prebuilt for your hardware". Kept apart from a transport failure so
+ *  the update check reports `no_release_asset` instead of the misleading `offline`: the API
+ *  answered, the machine is online, there is simply no build for it. */
+export class NoReleaseAssetError extends Error {
+  constructor(message = 'no_release_asset') {
+    super(message)
+    this.name = 'NoReleaseAssetError'
   }
 }
 
@@ -687,6 +713,13 @@ export interface TurboquantVariant {
 
 const TQ_WIN_CUDA13_RUNTIME = 'cudart-llama-bin-win-cuda-13.3-x64.zip'
 
+/** Upstream llama.cpp release whose assets carry {@link TQ_WIN_CUDA13_RUNTIME}. Pinned to its
+ *  OWN constant, not LLAMA_BUILD: the pack's name is versioned (`…-cuda-13.3-…`), so it exists
+ *  in only some upstream releases, and riding on LLAMA_BUILD meant an unrelated routine bump
+ *  could start 404ing the Windows CUDA 13.3 install with nothing to catch it. The pack is
+ *  resolved by NAME out of this tag's asset list, so a rename or removal fails loudly. */
+const TQ_CUDART_TAG = 'b9608'
+
 /** "13.4" ≥ "13.0"? Numeric major.minor compare; false for null/garbage. */
 function cudaAtLeast(have: string | null, want: string): boolean {
   if (!have) return false
@@ -733,32 +766,105 @@ export interface TurboquantResolution {
   variant: TurboquantVariant
   assetName: string
   url: string
+  /** GitHub's `sha256:<hex>` for the asset, when the release publishes one — what
+   *  `provisionTurboquant` hands to `downloadFile` to verify. */
+  digest?: string
 }
 
-/** PURE: the newest non-draft, non-prerelease release (API order is newest-first) carrying any
- *  of `candidates`, and the best candidate within it. Prefers .zip on Windows, .tar.gz elsewhere
- *  (the fork publishes both for Linux; extractArchive handles either). */
+/** PURE: a fork release tag `b<upstream build>-<semver>` split into its parts
+ *  (`b10298-2.0.0` → build 10298, semver [2,0,0]). null for the fork's earlier per-platform
+ *  tags (`turboquant-linux-x64-vulkan-<sha>`), which carry no version at all. */
+function parseTurboquantReleaseTag(tag: string): { build: number; semver: number[] } | null {
+  const m = /^b(\d+)-(\d+(?:\.\d+)*)$/i.exec(tag.trim())
+  return m ? { build: Number(m[1]), semver: m[2].split('.').map(Number) } : null
+}
+
+/** PURE: numeric compare of two dotted versions ("1.7.1" vs "1.7.0"); a missing part counts
+ *  as 0, so "2.0" and "2.0.0" are equal. */
+function cmpDotted(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0)
+    if (d !== 0) return d < 0 ? -1 : 1
+  }
+  return 0
+}
+
+/** PURE: which of two fork release tags is newer (-1 = `a` older, 1 = `a` newer, 0 = equal or
+ *  unorderable). The fork's semver decides first, then the upstream build — the same rule
+ *  update.ts's `compareTurboquantTags` applies to an installed tag, so the release an install
+ *  picks and the release the update check compares against cannot disagree. Legacy
+ *  per-platform tags (see {@link parseTurboquantReleaseTag}) have no version and sort BELOW
+ *  every `b<build>-<semver>` tag; two of them are equal, keeping the API's order between them. */
+export function compareTurboquantReleaseTags(a: string, b: string): number {
+  const pa = parseTurboquantReleaseTag(a)
+  const pb = parseTurboquantReleaseTag(b)
+  if (!pa || !pb) return pa ? 1 : pb ? -1 : 0
+  const bySemver = cmpDotted(pa.semver, pb.semver)
+  if (bySemver !== 0) return bySemver
+  return pa.build === pb.build ? 0 : pa.build < pb.build ? -1 : 1
+}
+
+/** PURE: every install attempt for this machine, best first — each candidate that has an asset
+ *  in the NEWEST release carrying any of them, in candidate order (the fork ships every
+ *  platform/backend in one release, so the alternates come from that same tag). Empty when no
+ *  release fits this OS/arch/GPU.
+ *
+ *  "Newest" is the HIGHEST tag, not the first one the API lists: GitHub orders releases by
+ *  creation time, so a patch cut for an older line (`b10269-1.7.1`, published after
+ *  `b10298-2.0.0`) would otherwise win every resolution and silently downgrade both fresh
+ *  installs and explicit updates. Same trap the llama.cpp build-tag resolver documents. */
+export function turboquantInstallPlan(
+  releases: GithubRelease[],
+  candidates: TurboquantVariant[],
+  platform: string,
+): TurboquantResolution[] {
+  const exts = platform === 'win32' ? ['.zip', '.tar.gz'] : ['.tar.gz', '.zip']
+  const assetOf = (rel: GithubRelease, name: string) =>
+    exts.map((ext) => rel.assets?.find((a) => a.name === `llama-turboquant-${name}${ext}`)).find(Boolean)
+  let best: GithubRelease | null = null
+  for (const rel of releases) {
+    if (rel.draft || rel.prerelease || !rel.tag_name) continue
+    if (!candidates.some((v) => assetOf(rel, v.name))) continue
+    if (!best?.tag_name || compareTurboquantReleaseTags(rel.tag_name, best.tag_name) > 0) best = rel
+  }
+  if (!best?.tag_name) return []
+  const out: TurboquantResolution[] = []
+  for (const variant of candidates) {
+    const asset = assetOf(best, variant.name)
+    if (asset) out.push({ tag: best.tag_name, variant, assetName: asset.name, url: asset.browser_download_url, digest: asset.digest ?? undefined })
+  }
+  return out
+}
+
+/** PURE: the single best TurboQuant build for this machine, or null when none fits. This is the
+ *  update check's answer, which only needs the tag an install would actually land on. */
 export function resolveTurboquantRelease(
   releases: GithubRelease[],
   candidates: TurboquantVariant[],
   platform: string,
 ): TurboquantResolution | null {
-  const exts = platform === 'win32' ? ['.zip', '.tar.gz'] : ['.tar.gz', '.zip']
-  for (const rel of releases) {
-    if (rel.draft || rel.prerelease || !rel.tag_name) continue
-    for (const variant of candidates) {
-      for (const ext of exts) {
-        const assetName = `llama-turboquant-${variant.name}${ext}`
-        const asset = rel.assets?.find((a) => a.name === assetName)
-        if (asset) return { tag: rel.tag_name, variant, assetName, url: asset.browser_download_url }
-      }
-    }
-  }
-  return null
+  return turboquantInstallPlan(releases, candidates, platform)[0] ?? null
 }
 
-/** This machine's {@link TurboquantHw}. nvidia-smi only runs when an NVIDIA GPU is present. */
-export async function detectTurboquantHw(): Promise<TurboquantHw> {
+/** Memo of {@link detectTurboquantHw} for the process lifetime — see that function. */
+let turboquantHwMemo: Promise<TurboquantHw> | null = null
+
+/** This machine's {@link TurboquantHw}, resolved ONCE per process and reused. Each resolution
+ *  spawns `nvidia-smi` twice with an 8 s timeout apiece, and the daemon re-runs the update
+ *  check on a timer, so re-deriving it per call was pure waste. Process-lifetime caching is
+ *  the deliberate tradeoff: a driver or GPU swapped in while the daemon runs is picked up on
+ *  the next restart, not mid-process. {@link resetTurboquantHwCache} exists for tests. */
+export function detectTurboquantHw(): Promise<TurboquantHw> {
+  turboquantHwMemo ??= detectTurboquantHwUncached()
+  return turboquantHwMemo
+}
+
+/** Drop the memoized hardware (tests, and any caller that must re-probe on purpose). */
+export function resetTurboquantHwCache(): void {
+  turboquantHwMemo = null
+}
+
+async function detectTurboquantHwUncached(): Promise<TurboquantHw> {
   const info = getSysInfo()
   const vendor = primaryVendor(info)
   let driverCuda: string | null = null
@@ -767,21 +873,31 @@ export async function detectTurboquantHw(): Promise<TurboquantHw> {
   return { platform: process.platform, arch: process.arch, vendor, hasGpu: info.gpus.length > 0, driverCuda, computeCaps }
 }
 
-/** Resolve the TurboQuant release + asset for `hw`, or null when none fits. Shared by the
- *  install, the update apply AND the update check, so the check can never offer a tag the
- *  apply wouldn't install (see latestTagForInstalled for how that once went wrong). */
-export async function fetchTurboquantRelease(
-  repo: string,
-  hw: TurboquantHw,
-  signal?: AbortSignal,
-): Promise<TurboquantResolution | null> {
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, {
-    headers: githubHeaders(),
-    signal,
-  })
-  if (isRateLimited(res)) throw new GithubRateLimitError(repo)
-  if (!res.ok) throw new Error(`could not query ${repo} releases: HTTP ${res.status}`)
-  return resolveTurboquantRelease((await res.json()) as GithubRelease[], turboquantCandidates(hw), hw.platform)
+/** A repo's releases, in GitHub's own (creation-time) order, following pagination until a short
+ *  page comes back. The fork publishes ~a dozen releases today, but a repo that grows past 100
+ *  would otherwise silently hide its newest tag from every resolver here. */
+async function listGithubReleases(repo: string, signal?: AbortSignal, maxPages = 3): Promise<GithubRelease[]> {
+  const out: GithubRelease[] = []
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}`, {
+      headers: githubHeaders(),
+      signal,
+    })
+    if (isRateLimited(res)) throw new GithubRateLimitError(repo)
+    if (!res.ok) throw new Error(`could not list ${repo} releases: HTTP ${res.status}`)
+    const batch = (await res.json()) as GithubRelease[]
+    out.push(...batch)
+    if (batch.length < 100) break
+  }
+  return out
+}
+
+/** The ordered TurboQuant install plan for `hw`: every candidate the newest fitting release
+ *  carries, best first. Empty when nothing fits this machine. Shared by the install, the
+ *  update apply AND the update check, so the check can never offer a tag the apply wouldn't
+ *  install (see latestTagForInstalled for how that once went wrong). */
+export async function fetchTurboquantPlan(repo: string, hw: TurboquantHw, signal?: AbortSignal): Promise<TurboquantResolution[]> {
+  return turboquantInstallPlan(await listGithubReleases(repo, signal), turboquantCandidates(hw), hw.platform)
 }
 
 /** True when `dir` holds a CUDA backend without its runtime beside it — what an install
@@ -798,6 +914,24 @@ function cudaRuntimeMissing(dir: string): boolean {
   }
 }
 
+/** The provision marker's contents. `variant` is what makes a driver/GPU change detectable:
+ *  see {@link needsTurboquantReprovision}. */
+export interface TurboquantMarker {
+  tag?: string
+  variant?: string
+  assets?: string[]
+  backfilled?: boolean
+}
+
+/** Read the provision marker from a build dir, or null when absent/unreadable. */
+function readTurboquantMarker(destDir: string): TurboquantMarker | null {
+  try {
+    return JSON.parse(readFileSync(join(destDir, PROVISION_MARKER), 'utf8')) as TurboquantMarker
+  } catch {
+    return null
+  }
+}
+
 /** The installed TurboQuant server under `destDir`, or null when absent or incomplete. A
  *  marker-less dir (installed before the marker existed) counts unless its CUDA runtime is
  *  missing; the marker is backfilled so this is derived once. */
@@ -810,36 +944,82 @@ function installedTurboquant(destDir: string): string | null {
   return bin
 }
 
-/** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`: resolve
- *  the release + variant for this machine, download → extract (plus the CUDA runtime pack
- *  when the variant needs one) → locate. Throws `no_release_asset` when no prebuilt fits. */
-export async function provisionTurboquant(
+/** PURE: the compute-backend family a variant name names (`linux-x64-cuda-13.3` → `cuda`), or
+ *  null when the name carries no backend suffix (the macOS archive, which is Metal). */
+function turboquantBackend(name: string): string | null {
+  if (/macos/i.test(name)) return 'metal'
+  return /-(cuda-[\d.]+|rocm|vulkan|cpu)$/i.exec(name)?.[1]?.split('-')[0]?.toLowerCase() ?? null
+}
+
+/** The `--list-devices` name prefixes that prove a variant's backend loaded, or null when
+ *  there is nothing to prove (the CPU build). Prefixes, not equality, because ggml appends the
+ *  device index (`CUDA0`, `Vulkan0`, `MTL0`) and HIP builds report either ROCm or HIP. */
+function loadedDevicePrefixes(name: string): string[] | null {
+  switch (turboquantBackend(name)) {
+    case 'cuda': return ['cuda']
+    case 'rocm': return ['rocm', 'hip', 'roc']
+    case 'vulkan': return ['vulkan']
+    case 'metal': return ['mtl', 'metal']
+    default: return null
+  }
+}
+
+/** Whether the freshly installed binary actually LOADS the backend its variant promises. The
+ *  failure this catches is silent: the process starts, no GPU device appears, and ggml runs on
+ *  the CPU without an error (the unverified Windows CUDA 13.3 path; a CUDA 12.4 build on a GPU
+ *  whose kernels it lacks). null from `listDevices` means the output format wasn't recognised,
+ *  which counts as "cannot tell" → true: we only reject a build when the binary DID print a
+ *  device list and our backend wasn't in it. */
+async function backendLoads(bin: string, variant: TurboquantVariant): Promise<boolean> {
+  const want = loadedDevicePrefixes(variant.name)
+  if (!want) return true
+  const devices = await listDevices(bin)
+  if (devices === null) return true
+  return devices.some((d) => want.some((p) => d.toLowerCase().startsWith(p)))
+}
+
+/** PURE: whether an already-installed build has to be replaced because this machine can no
+ *  longer run it — the marker records the variant we installed, and no candidate of the same
+ *  backend family is on offer today. In practice only the CUDA families can drop out (the GPU
+ *  was swapped for another vendor's, or for a generation the build has no kernels for); a
+ *  Vulkan/CPU/Metal build runs anywhere its platform allows and is never replaced, and neither
+ *  is an install on a machine whose GPU has merely stopped being visible: candidates collapse
+ *  to the CPU build then, and an unreadable `nvidia-smi` must never delete a working GPU
+ *  install. Marker-less installs have nothing to compare and are left alone too. */
+export function needsTurboquantReprovision(marker: TurboquantMarker | null, candidates: TurboquantVariant[]): boolean {
+  const installed = marker?.variant ? turboquantBackend(marker.variant) : null
+  if (!installed || installed === 'cpu') return false
+  if (candidates.length === 1 && turboquantBackend(candidates[0].name) === 'cpu') return false
+  return !candidates.some((c) => turboquantBackend(c.name) === installed)
+}
+
+/** The bare hex from GitHub's `sha256:<hex>` asset digest, or undefined when it isn't one. */
+function sha256Of(digest?: string): string | undefined {
+  return digest?.startsWith('sha256:') ? digest.slice('sha256:'.length) : undefined
+}
+
+/** The upstream runtime pack named `packName`, looked up by NAME in its pinned tag's asset list
+ *  so both the URL and the published sha256 come from the API instead of a hand-built path. */
+async function runtimePackArchive(packName: string, signal?: AbortSignal): Promise<{ name: string; url: string; sha256?: string }> {
+  const asset = (await releaseAssetsForTag(REPO, TQ_CUDART_TAG, signal)).find((a) => a.name === packName)
+  if (!asset) throw new Error(`no_release_asset: ${REPO}@${TQ_CUDART_TAG} does not carry ${packName}`)
+  return { name: asset.name, url: asset.browser_download_url, sha256: sha256Of(asset.digest ?? undefined) }
+}
+
+/** Download + extract ONE planned variant into `destDir` and return its server binary. The
+ *  provision marker is written only once every archive is in place, so an install interrupted
+ *  between the binary and its runtime pack is never mistaken for a complete one. */
+async function installTurboquantVariant(
   enginesRoot: string,
-  repo: string,
+  destDir: string,
+  resolved: TurboquantResolution,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  hw?: TurboquantHw,
 ): Promise<string> {
-  const destDir = join(enginesRoot, 'turboquant')
-  const existing = installedTurboquant(destDir)
-  if (existing) {
-    // Strip quarantine even on the fast-path: a previous failed probe leaves the
-    // directory intact with the quarantine attribute still set.
-    stripMacOsQuarantine(destDir)
-    return existing
-  }
-  rmSync(destDir, { recursive: true, force: true }) // an incomplete earlier install
-
-  const resolved = await fetchTurboquantRelease(repo, hw ?? (await detectTurboquantHw()), signal)
-  if (!resolved) throw new Error('no_release_asset')
-  const { variant } = resolved
-  const archives = [{ name: resolved.assetName, url: resolved.url }]
-  if (variant.cudartPack) {
-    archives.push({
-      name: variant.cudartPack,
-      url: `https://github.com/${REPO}/releases/download/${LLAMA_BUILD}/${variant.cudartPack}`,
-    })
-  }
+  const archives: { name: string; url: string; sha256?: string }[] = [
+    { name: resolved.assetName, url: resolved.url, sha256: sha256Of(resolved.digest) },
+  ]
+  if (resolved.variant.cudartPack) archives.push(await runtimePackArchive(resolved.variant.cudartPack, signal))
 
   mkdirSync(destDir, { recursive: true })
   const parts = archives.length
@@ -850,7 +1030,7 @@ export async function provisionTurboquant(
       const tmp = join(enginesRoot, archive.name)
       tmpPaths.push(tmp)
       onProgress?.({ phase: 'downloading', pct: 0, part, parts })
-      await downloadFile(archive.url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal)
+      await downloadFile(archive.url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal, archive.sha256)
       onProgress?.({ phase: 'extracting', pct: -1, part, parts })
       // The runtime pack's DLLs sit at its root; Windows only searches the exe's own dir.
       const bin = i === 0 ? null : findServer(destDir)
@@ -865,6 +1045,69 @@ export async function provisionTurboquant(
 
   const bin = findServer(destDir)
   if (!bin) throw new Error('llama-server not found in extracted TurboQuant archive')
-  writeFileSync(join(destDir, PROVISION_MARKER), JSON.stringify({ tag: resolved.tag, assets: archives.map((a) => a.name) }))
+  writeFileSync(
+    join(destDir, PROVISION_MARKER),
+    JSON.stringify({ tag: resolved.tag, variant: resolved.variant.name, assets: archives.map((a) => a.name) }),
+  )
   return bin
+}
+
+/** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`: resolve the
+ *  newest release that fits this machine, then download → extract (plus the CUDA runtime pack
+ *  when the variant needs one) → locate → verify the backend it promised actually loads.
+ *
+ *  The plan is walked in order, so a build that installs but whose backend doesn't come up
+ *  falls through to the next candidate (CUDA 13.3 → CUDA 12.4 → Vulkan) instead of leaving a
+ *  silent CPU-only install behind. Throws `no_release_asset` when no prebuilt fits at all.
+ *
+ *  `force` re-installs even though a complete install is already there — what the update path
+ *  wants, having already decided the installed tag is behind. It still resolves before deleting
+ *  anything, so a failed lookup leaves the old build exactly where it was. */
+export async function provisionTurboquant(
+  enginesRoot: string,
+  repo: string,
+  onProgress?: (p: ProvisionProgress) => void,
+  signal?: AbortSignal,
+  hw?: TurboquantHw,
+  force = false,
+): Promise<string> {
+  const destDir = join(enginesRoot, 'turboquant')
+  const hardware = hw ?? (await detectTurboquantHw())
+  const existing = installedTurboquant(destDir)
+  if (existing && !force && !needsTurboquantReprovision(readTurboquantMarker(destDir), turboquantCandidates(hardware))) {
+    // Strip quarantine even on the fast-path: a previous failed probe leaves the
+    // directory intact with the quarantine attribute still set.
+    stripMacOsQuarantine(destDir)
+    return existing
+  }
+  // Resolve BEFORE removing anything: a lookup that fails (offline, rate-limited) must not
+  // destroy an install that is sitting there working.
+  const plan = await fetchTurboquantPlan(repo, hardware, signal)
+  if (!plan.length) throw new NoReleaseAssetError()
+  rmSync(destDir, { recursive: true, force: true }) // an incomplete earlier install, or a variant this machine can't run
+
+  let lastError: unknown = null
+  for (const resolved of plan) {
+    try {
+      const bin = await installTurboquantVariant(enginesRoot, destDir, resolved, onProgress, signal)
+      // Only verify when there's an alternative to fall back to: a single-candidate machine
+      // (Apple Silicon's Metal build) can do no better than the install it just made, so
+      // failing it over an unverifiable probe could only break it.
+      if (plan.length > 1 && !(await backendLoads(bin, resolved.variant))) {
+        throw new Error(`the ${resolved.variant.name} build did not load its ${turboquantBackend(resolved.variant.name)} backend`)
+      }
+      return bin
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') {
+        rmSync(destDir, { recursive: true, force: true })
+        throw e
+      }
+      lastError = e
+      rmSync(destDir, { recursive: true, force: true })
+    }
+  }
+  throw new Error(
+    `no TurboQuant build for this machine worked (tried ${plan.map((p) => p.variant.name).join(', ')}): ` +
+      `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  )
 }

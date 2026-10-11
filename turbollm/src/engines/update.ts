@@ -15,8 +15,16 @@
 // the tests exercise directly; checkUpdate/the scheduler are thin shells over them.
 
 import type { Engine } from '../config/config'
-import { type BackendId, GithubRateLimitError, latestBuildTagRelease, latestCommitSha, latestReleaseTag } from './download'
-import { detectTurboquantHw, fetchTurboquantRelease } from './download'
+import {
+  type BackendId,
+  GithubRateLimitError,
+  NoReleaseAssetError,
+  detectTurboquantHw,
+  fetchTurboquantPlan,
+  latestBuildTagRelease,
+  latestCommitSha,
+  latestReleaseTag,
+} from './download'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -128,9 +136,10 @@ export interface UpdateStatus {
   checkedAt: string
   /** Set when the check could not complete: 'offline' (network), 'rate_limited' (GitHub's
    *  API quota is spent — the box is online, so saying "offline" would misdirect the user
-   *  into debugging their connection) or 'no_source' (engine has no known update source).
+   *  into debugging their connection), 'no_release_asset' (the upstream release was read fine
+   *  but has no build this machine can run) or 'no_source' (engine has no known update source).
    *  Mutually exclusive with a non-null latest. */
-  error?: 'offline' | 'rate_limited' | 'no_source'
+  error?: 'offline' | 'rate_limited' | 'no_release_asset' | 'no_source'
   /** When latest couldn't be parsed/compared against installed → result was `unknown`.
    *  The UI shows "couldn't compare" rather than a false up-to-date. */
   comparable: boolean
@@ -329,8 +338,13 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   if (src.source === 'source') return latestCommitSha(src.ref, src.branch ?? '', signal)
   // TurboQuant: the same resolver the install/apply uses (newest release with a build for THIS
   // machine), not `releases/latest` — otherwise the two can disagree and the update repeats.
+  // An empty plan is a REAL answer (no prebuilt for this hardware), not a failed check, so it
+  // throws NoReleaseAssetError rather than returning '' — which would have been reported as if
+  // the machine were offline.
   if (src.ref === TURBOQUANT_REPO) {
-    return (await fetchTurboquantRelease(src.ref, await detectTurboquantHw(), signal))?.tag ?? ''
+    const plan = await fetchTurboquantPlan(src.ref, await detectTurboquantHw(), signal)
+    if (!plan.length) throw new NoReleaseAssetError()
+    return plan[0].tag
   }
   // When the INSTALLED version is a llama.cpp-style build tag, resolve the newest build-tag
   // release rather than GitHub's `releases/latest`. llama.cpp publishes both `b#####` per-build
@@ -357,10 +371,12 @@ export async function computeUpdateStatus(
   try {
     latest = await fetcher(src, signal)
   } catch (e) {
-    // Distinguish an exhausted GitHub quota from a real network failure. Both mean "couldn't
-    // check", but only one is fixable by the user (add a token), and calling a rate limit
-    // "offline" sends them debugging a connection that is working fine.
-    const error = e instanceof GithubRateLimitError ? 'rate_limited' : 'offline'
+    // Distinguish an exhausted GitHub quota, and a release that simply has no build for this
+    // machine, from a real network failure. All three mean "couldn't check", but only the last
+    // is the user's connection: calling a rate limit (or a missing prebuilt) "offline" sends
+    // them debugging a connection that is working fine.
+    const error =
+      e instanceof GithubRateLimitError ? 'rate_limited' : e instanceof NoReleaseAssetError ? 'no_release_asset' : 'offline'
     return { installed: src.installed, latest: null, hasUpdate: false, checkedAt, error, comparable: false }
   }
   if (!latest) {
