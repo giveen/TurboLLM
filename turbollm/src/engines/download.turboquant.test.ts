@@ -563,8 +563,10 @@ test('detectTurboquantHw: a probe that came back without the NVIDIA driver versi
 
 test('provisionTurboquant: extracts a real Windows .zip and finds llama-server.exe', win, async (t) => {
   const root = tmpDir('tllm-tq-')
-  // A CUDA 12.2 driver leaves Vulkan as the only candidate → a single-entry plan, so the
-  // backend probe stays out of the way and this test is about Expand-Archive.
+  // A CUDA 12.2 driver leaves Vulkan plus the CPU last resort. The fixture's .exe can't run, so
+  // the Vulkan build fails its backend check and the walk ends on the CPU build; what this test
+  // is about is Expand-Archive producing both members and findServer reaching the .exe through
+  // them — `existsSync` on the DLL pins the second member, not just the binary.
   const zip = makeZip({
     'build/bin/llama-server.exe': 'not a real exe',
     'build/bin/ggml-vulkan.dll': '',
@@ -573,7 +575,12 @@ test('provisionTurboquant: extracts a real Windows .zip and finds llama-server.e
 
   const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32', driverCuda: '12.2' }))
   assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server.exe'))
-  assert.equal(JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant, 'windows-x64-vulkan')
+  assert.ok(existsSync(join(root, 'turboquant', 'build', 'bin', 'ggml-vulkan.dll')))
+  assert.equal(
+    JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant,
+    'windows-x64-cpu',
+    'the .exe never loads, so the last candidate is what is left installed',
+  )
 })
 
 test('provisionTurboquant: a Windows build whose backend never loads falls through to the last candidate', win, async (t) => {
