@@ -35,6 +35,15 @@ import { sourceBuildDirOf } from './build-runner'
  *  `platform` to the pure pickers keep the archive's own name instead. */
 const BIN = serverBinName
 
+/** The library members the installer gathers on THIS platform: `isPlatformLib` keys off the
+ *  extension, so a `.so` in a Windows zip is correctly skipped (and a `.dll` on Linux), and a
+ *  fixture that asserts those files landed has to name them the way the installed platform does.
+ *  The versioned soname / numbered runtime DLL are deliberate — the point is "the runtime beside
+ *  the binary", not a bare basename. */
+const LIBS: [string, string] = process.platform === 'win32'
+  ? ['ggml.dll', 'cudart64_12.dll']
+  : ['libggml.so', 'libcudart.so.12']
+
 function member(name: string, data = `content of ${name}`): ZipMember {
   return { name, data: Buffer.from(data) }
 }
@@ -364,16 +373,16 @@ test('installZipEngine: upload → extract under engines/build/<slug>/ → probe
   try {
     const buf = buildZipArchive([
       member(`dist/bin/${BIN}`, 'elf'),
-      member('dist/bin/libggml.so', 'so'),
-      member('runtime/libcudart.so.12', 'cudart'),
+      member(`dist/bin/${LIBS[0]}`, 'so'),
+      member(`runtime/${LIBS[1]}`, 'cudart'),
     ])
     const res = await installZipEngine(root, 'myfork.zip', buf, { probeFn: STUB_PROBE })
     assert.ok(res.found)
     assert.equal(res.binPath, join(root, 'build', 'myfork', BIN))
     assert.equal(res.version, 'b4242 (0deadbe)')
     assert.equal(res.suggestedName, 'myfork (b4242)')
-    assert.equal(existsSync(join(root, 'build', 'myfork', 'libggml.so')), true)
-    assert.equal(existsSync(join(root, 'build', 'myfork', 'libcudart.so.12')), true)
+    assert.equal(existsSync(join(root, 'build', 'myfork', LIBS[0])), true)
+    assert.equal(existsSync(join(root, 'build', 'myfork', LIBS[1])), true)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
