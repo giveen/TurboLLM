@@ -1103,6 +1103,15 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
+        // `update=1` replaces the install dir under whatever is running from it: stop the engine
+        // — and any pool slot — on it first, the way the update path does (update-apply.ts). A
+        // plain install reuses an existing install as-is (provisionTurboquant's fast path), so
+        // it must not tear a serving engine down for nothing.
+        if (upgrade) {
+          const turboquantDir = join(root, 'turboquant')
+          const runningFromIt = d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, turboquantDir))
+          if (runningFromIt) await stopEngineUsers(d, runningFromIt.id)
+        }
         const bin = await provisionTurboquant(root, entry.repo!, (p) =>
           d.provision.progress(p.phase, p.pct, p.part, p.parts),
         undefined, undefined, upgrade)
