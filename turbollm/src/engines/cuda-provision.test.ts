@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { majorMinor, cmpMajorMinor, parseComputeCaps, parseDriverMaxCuda, pickCudaVersion } from './cuda-provision'
+import { majorMinor, cmpMajorMinor, pickCudaVersion } from './cuda-provision'
+import { parseComputeCaps, parseDriverMaxCuda } from './nvidia-smi'
 
 test('parseComputeCaps: one value per GPU line, junk skipped', () => {
   assert.deepEqual(parseComputeCaps('12.0\n'), [12])

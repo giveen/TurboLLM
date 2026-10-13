@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
   compareTurboquantReleaseTags,
@@ -21,6 +21,7 @@ import {
   type TurboquantHw,
 } from './download'
 import { tmpDir } from '../test-support/tmp'
+import { buildZipArchive } from '../test-support/zip-archive'
 
 const REPO = 'AtomicBot-ai/atomic-llama-cpp-turboquant'
 
@@ -196,21 +197,13 @@ const fakeServer = (...lines: string[]) => `#!/bin/sh\n${lines.map((l) => `echo 
 
 const win = { skip: process.platform !== 'win32' && 'Windows-only extraction path (PowerShell Expand-Archive)' }
 
-/** A REAL .zip, built with the same PowerShell `Compress-Archive` the production extractor
- *  corresponds to. `tar`-built bytes named .zip would let the Windows path pass on Linux while
- *  never touching Expand-Archive — which is exactly the gap this closes. On Windows the engine
- *  binary is `llama-server.exe` (what findServer looks for), so tests here name it that. */
-function makeZip(dir: string, contents: Record<string, string>): Buffer {
-  const src = join(dir, 'zip-src')
-  for (const [rel, body] of Object.entries(contents)) {
-    const path = join(src, rel)
-    mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, body)
-  }
-  const out = join(dir, 'a.zip')
-  execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-    `Compress-Archive -Path '${join(src, '*')}' -DestinationPath '${out}' -Force`])
-  return readFileSync(out)
+/** A REAL .zip, built in memory by the repo's own zip fixture builder so it is a zip on every
+ *  platform: PowerShell Expand-Archive reads it on Windows (what the win-gated tests cover),
+ *  the pure-Node reader reads it elsewhere. `tar`-built bytes named .zip would let a zip path
+ *  pass without any zip ever being read. On Windows the engine binary is `llama-server.exe`
+ *  (what findServer looks for), so tests here name it that. */
+function makeZip(contents: Record<string, string>): Buffer {
+  return buildZipArchive(Object.entries(contents).map(([name, data]) => ({ name, data: Buffer.from(data) })))
 }
 
 test('provisionTurboquant: installs the CUDA build for an NVIDIA box and records the tag', unix, async (t) => {
@@ -321,6 +314,29 @@ test('provisionTurboquant: a forced update whose release lookup fails keeps the 
   assert.ok(existsSync(join(binDir, 'llama-server')), 'the update failed, but the old build is still installed')
 })
 
+test('provisionTurboquant: a forced update that fails on EVERY candidate keeps the working install', unix, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  const archive = makeArchive(tmpDir('tllm-tq-src-'), {
+    'build/bin/llama-server': fakeServer('Available devices:', '  CUDA0: Fake GPU (100 MiB, 90 MiB free)'),
+    'build/bin/libcudart.so.13': '',
+  })
+  fakeGithub(t, RELEASES, archive)
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+  const marker = readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')
+
+  // Every candidate now serves bytes that are not an archive, so each one fails after the
+  // download — the shape a truncated release, a bad mirror or a checksum mismatch takes.
+  fakeGithub(t, RELEASES, Buffer.from('not an archive at all'))
+  await assert.rejects(
+    provisionTurboquant(root, REPO, undefined, undefined, hw({}), true),
+    /no TurboQuant build for this machine worked/,
+  )
+  assert.ok(existsSync(bin), 'the registry still points here — the failed update must not have deleted it')
+  assert.equal(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8'), marker, 'and the old marker is intact')
+  assert.deepEqual(readdirSync(join(root, 'build')).filter((d) => d.startsWith('.turboquant-')), [], 'no staging dir is left behind')
+  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, hw({})), bin, 'the intact install is still the fast path')
+})
+
 for (const [how, script] of [
   ['a backend that reports no device', fakeServer('Available devices:', '  (none)')],
   ['a binary that dies on --list-devices', '#!/bin/sh\nexit 1\n'],
@@ -344,7 +360,8 @@ for (const [how, script] of [
 
 test('provisionTurboquant: a single-candidate machine keeps its build even when the probe sees no device', unix, async (t) => {
   // Apple Silicon has exactly one prebuilt. Failing it over an unverifiable probe could only
-  // break a working install, so the probe arbitrates only when there IS an alternative.
+  // break a working install, so a failed backend check on the LAST candidate is a warning, not
+  // a rejection — there is nothing else to try.
   const root = tmpDir('tllm-tq-')
   const archive = makeArchive(tmpDir('tllm-tq-src-'), {
     'build/bin/llama-server': fakeServer('Available devices:', '  (none)'),
@@ -352,6 +369,27 @@ test('provisionTurboquant: a single-candidate machine keeps its build even when 
   fakeGithub(t, RELEASES, archive)
 
   const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'darwin', arch: 'arm64', vendor: 'apple' }))
+  assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server'))
+})
+
+test('provisionTurboquant: a machine whose every GPU build is dead ends on the CPU last resort', unix, async (t) => {
+  // Every build installs but reports no device (the fork's silent CPU fallback), so CUDA 13.3,
+  // CUDA 12.4 and Vulkan are each rejected and the walk must not stop at "nothing worked".
+  const root = tmpDir('tllm-tq-')
+  const archive = makeArchive(tmpDir('tllm-tq-src-'), {
+    'build/bin/llama-server': fakeServer('Available devices:', '  (none)'),
+  })
+  const calls = fakeGithub(t, RELEASES, archive)
+
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+  for (const name of ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4', 'linux-x64-vulkan', 'linux-x64-cpu']) {
+    assert.ok(calls.some((u) => u.endsWith(`llama-turboquant-${name}.tar.gz`)), `tried ${name}`)
+  }
+  assert.equal(
+    JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant,
+    'linux-x64-cpu',
+    'the CPU build is what the machine ends up on, not a GPU build that never loaded',
+  )
   assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server'))
 })
 
@@ -380,11 +418,11 @@ test('provisionTurboquant: replaces a build this machine can no longer run', uni
 
 test('provisionTurboquant: the Windows CUDA 13.3 runtime pack is resolved from its own pinned tag, beside the binary', unix, async (t) => {
   const root = tmpDir('tllm-tq-')
-  const main = makeArchive(tmpDir('tllm-tq-src-'), {
+  const main = makeZip({
     'build/bin/llama-server': fakeServer('Available devices:', '  CUDA0: Fake GPU (100 MiB, 90 MiB free)'),
     'build/bin/ggml-cuda.dll': '',
   })
-  const pack = makeArchive(tmpDir('tllm-tq-src-'), { 'cudart64_13.dll': 'runtime' })
+  const pack = makeZip({ 'cudart64_13.dll': 'runtime' })
   const asset: ReleaseAsset = {
     name: 'cudart-llama-bin-win-cuda-13.3-x64.zip',
     browser_download_url: 'https://dl.example/llama.cpp/b9608/cudart-llama-bin-win-cuda-13.3-x64.zip',
@@ -441,13 +479,23 @@ test('turboquantInstallPlan: the highest tag wins, not the first the API lists',
 
 test('turboquantInstallPlan: every candidate of that release, best first, all at one tag', () => {
   const plan = turboquantInstallPlan(RELEASES, turboquantCandidates(hw({})), 'linux')
-  assert.deepEqual(plan.map((p) => p.variant.name), ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4', 'linux-x64-vulkan'])
+  assert.deepEqual(
+    plan.map((p) => p.variant.name),
+    ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4', 'linux-x64-vulkan', 'linux-x64-cpu'],
+    'the CPU build is the x64 last resort, appended after every GPU-capable one',
+  )
   assert.ok(plan.every((p) => p.tag === 'b10298-2.0.0'))
   // A candidate the newest release simply doesn't ship is absent, not a hole in the plan.
   const noVulkan = [rel('b2-1.0.0', CURRENT_ASSETS.filter((n) => !n.includes('vulkan')))]
   assert.deepEqual(
     turboquantInstallPlan(noVulkan, turboquantCandidates(hw({})), 'linux').map((p) => p.variant.name),
-    ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4'],
+    ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4', 'linux-x64-cpu'],
+  )
+  // Apple Silicon: the fork ships no CPU build, and x64-only since it would be the wrong arch.
+  assert.deepEqual(
+    turboquantInstallPlan(RELEASES, turboquantCandidates(hw({ platform: 'darwin', arch: 'arm64', vendor: 'apple' })), 'darwin')
+      .map((p) => p.variant.name),
+    ['macos-arm64'],
   )
 })
 
@@ -464,6 +512,13 @@ test('needsTurboquantReprovision: only when no candidate shares the installed ba
   // The GPU merely stopped being visible (candidates collapse to the CPU build): keep it —
   // an unreadable nvidia-smi must never delete a working CUDA install.
   assert.equal(needsTurboquantReprovision({ variant: 'linux-x64-cuda-13.3' }, turboquantCandidates(hw({ vendor: 'unknown', hasGpu: false, driverCuda: null }))), false)
+  // The other unreadable-probe shape: the GPU is still visible but the DRIVER VERSION probe
+  // failed, so the candidates collapse to Vulkan. That is "cannot tell", not "no CUDA for this
+  // machine" — replacing a working CUDA build on it costs the install and ~500 MB.
+  const noDriver = hw({ driverCuda: null, computeCaps: [] })
+  assert.deepEqual(names({ driverCuda: null }), ['linux-x64-vulkan'])
+  assert.equal(needsTurboquantReprovision({ variant: 'linux-x64-cuda-13.3' }, turboquantCandidates(noDriver), noDriver), false)
+  assert.equal(needsTurboquantReprovision({ variant: 'linux-x64-cuda-13.3' }, turboquantCandidates(noDriver)), true, 'without hw there is nothing to tell a failed probe from a machine with no CUDA build')
   // Pre-marker installs have nothing to compare against.
   assert.equal(needsTurboquantReprovision({ backfilled: true }, nvidia), false)
   assert.equal(needsTurboquantReprovision(null, nvidia), false)
@@ -482,6 +537,26 @@ test('detectTurboquantHw: resolved once per process — repeat calls share one p
   assert.notEqual(detectTurboquantHw(), first)
 })
 
+test('detectTurboquantHw: a probe that came back without the NVIDIA driver version is not memoized', async () => {
+  resetTurboquantHwCache()
+  // The shape a failed/timed-out nvidia-smi leaves: the GPU is there, the driver version isn't.
+  const unknownDriver = hw({ driverCuda: null, computeCaps: [] })
+  let probes = 0
+  const probe = async () => { probes++; return unknownDriver }
+  await detectTurboquantHw(probe)
+  await detectTurboquantHw(probe)
+  assert.equal(probes, 2, 'a failed driver probe is retried on the next call, not cached for the process')
+
+  // A complete answer is still cached — the memo exists to spare two nvidia-smi spawns per call.
+  resetTurboquantHwCache()
+  let settled = 0
+  const complete = async () => { settled++; return hw({}) }
+  await detectTurboquantHw(complete)
+  await detectTurboquantHw(complete)
+  assert.equal(settled, 1, 'a settled probe with a known driver is reused')
+  resetTurboquantHwCache()
+})
+
 // ─── Windows (PowerShell Expand-Archive) ─────────────────────────────────────
 // Skipped on Linux, where `unix` tests above cover the same logic through `tar`. These run on
 // the windows-latest CI job; the extraction itself and the .exe naming are Windows-only.
@@ -490,7 +565,7 @@ test('provisionTurboquant: extracts a real Windows .zip and finds llama-server.e
   const root = tmpDir('tllm-tq-')
   // A CUDA 12.2 driver leaves Vulkan as the only candidate → a single-entry plan, so the
   // backend probe stays out of the way and this test is about Expand-Archive.
-  const zip = makeZip(tmpDir('tllm-tq-src-'), {
+  const zip = makeZip({
     'build/bin/llama-server.exe': 'not a real exe',
     'build/bin/ggml-vulkan.dll': '',
   })
@@ -501,20 +576,30 @@ test('provisionTurboquant: extracts a real Windows .zip and finds llama-server.e
   assert.equal(JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant, 'windows-x64-vulkan')
 })
 
-test('provisionTurboquant: a Windows build whose backend never loads is replaced by the next candidate', win, async (t) => {
+test('provisionTurboquant: a Windows build whose backend never loads falls through to the last candidate', win, async (t) => {
   // The reviewer's #1 scenario, on real Windows: the fork's CUDA 13.3 zip installs, but its
   // backend doesn't come up (here the fixture binary can't run at all — the same observable
-  // outcome as the missing-runtime DLLs). The install must not be left in place as "working".
+  // outcome as the missing-runtime DLLs). Every candidate is tried, and since nothing follows
+  // the CPU build, THAT one is kept with a warning rather than leaving the machine with no
+  // engine at all.
   const root = tmpDir('tllm-tq-')
-  const zip = makeZip(tmpDir('tllm-tq-src-'), { 'build/bin/llama-server.exe': 'not a real exe' })
+  const zip = makeZip({ 'build/bin/llama-server.exe': 'not a real exe' })
   const pack: ReleaseAsset = {
     name: 'cudart-llama-bin-win-cuda-13.3-x64.zip',
     browser_download_url: 'https://dl.example/llama.cpp/b9608/cudart-llama-bin-win-cuda-13.3-x64.zip',
   }
   const calls = fakeGithub(t, RELEASES, zip, [pack])
 
-  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32' })), /no TurboQuant build for this machine worked/)
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32' }))
   assert.ok(calls.includes(pack.browser_download_url), 'the separate CUDA runtime pack was fetched')
-  assert.ok(calls.some((u) => u.endsWith('llama-turboquant-windows-x64-cuda-12.4.zip')), 'and the next candidate was tried')
-  assert.equal(existsSync(join(root, 'turboquant', 'build', 'bin', 'llama-server.exe')), false, 'nothing broken was left installed')
+  for (const name of ['windows-x64-cuda-13.3', 'windows-x64-cuda-12.4', 'windows-x64-vulkan', 'windows-x64-cpu']) {
+    assert.ok(calls.some((u) => u.endsWith(`llama-turboquant-${name}.zip`)), `tried ${name}`)
+  }
+  assert.equal(
+    JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant,
+    'windows-x64-cpu',
+    'the last candidate is kept — never the CUDA build that never loaded',
+  )
+  assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server.exe'))
+  assert.deepEqual(readdirSync(join(root, 'build')).filter((d) => d.startsWith('.turboquant-')), [], 'no staging dir is left behind')
 })

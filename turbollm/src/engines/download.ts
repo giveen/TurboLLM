@@ -4,18 +4,17 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, join, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import { getSysInfo, primaryVendor, type GpuVendor } from '../sysinfo/sysinfo'
-// cuda-provision imports this module back (downloadFile/extractArchive); both sides only call
-// each other from inside functions, never at module load, so the cycle is safe.
-import { driverMaxCuda, nvidiaComputeCaps } from './cuda-provision'
-// probe is a leaf module (it imports only config), so this direction can't cycle.
+// nvidia-smi and probe are leaf modules (the former imports only node builtins, the latter
+// only config), so importing them keeps this module free of an import cycle.
+import { driverMaxCuda, nvidiaComputeCaps } from './nvidia-smi'
 import { listDevices } from './probe'
 import { extractZipAll } from './zip-reader'
 
@@ -902,11 +901,21 @@ export function turboquantInstallPlan(
     if (!best?.tag_name || compareTurboquantReleaseTags(rel.tag_name, best.tag_name) > 0) best = rel
   }
   if (!best?.tag_name) return []
+  const release = best
+  const tag: string = best.tag_name
   const out: TurboquantResolution[] = []
-  for (const variant of candidates) {
-    const asset = assetOf(best, variant.name)
-    if (asset) out.push({ tag: best.tag_name, variant, assetName: asset.name, url: asset.browser_download_url, digest: asset.digest ?? undefined })
+  const push = (variant: TurboquantVariant) => {
+    const asset = assetOf(release, variant.name)
+    if (asset) out.push({ tag, variant, assetName: asset.name, url: asset.browser_download_url, digest: asset.digest ?? undefined })
   }
+  for (const variant of candidates) push(variant)
+  // CPU is the fork's x64 last resort, appended AFTER every GPU-capable build: it is only
+  // worth its download once the GPU builds have failed to come up, and it is what keeps a
+  // machine whose GPU backend won't load from ending up with no engine at all. (An x64
+  // machine with no GPU already has it first, from turboquantCandidates.)
+  const os = platform === 'win32' ? 'windows' : platform === 'linux' ? 'linux' : null
+  const cpuLastResort = os && candidates.some((c) => c.name.includes('-x64-')) ? `${os}-x64-cpu` : null
+  if (cpuLastResort && !out.some((r) => r.variant.name === cpuLastResort)) push({ name: cpuLastResort })
   return out
 }
 
@@ -927,9 +936,23 @@ let turboquantHwMemo: Promise<TurboquantHw> | null = null
  *  spawns `nvidia-smi` twice with an 8 s timeout apiece, and the daemon re-runs the update
  *  check on a timer, so re-deriving it per call was pure waste. Process-lifetime caching is
  *  the deliberate tradeoff: a driver or GPU swapped in while the daemon runs is picked up on
- *  the next restart, not mid-process. {@link resetTurboquantHwCache} exists for tests. */
-export function detectTurboquantHw(): Promise<TurboquantHw> {
-  turboquantHwMemo ??= detectTurboquantHwUncached()
+ *  the next restart, not mid-process — EXCEPT when the probe came back without a driver
+ *  version on an NVIDIA box, which is a failed probe rather than a machine description, and is
+ *  re-run on the next call. `probe` is the test seam for that policy (production callers pass
+ *  nothing); {@link resetTurboquantHwCache} drops the memo outright. */
+export function detectTurboquantHw(probe: () => Promise<TurboquantHw> = detectTurboquantHwUncached): Promise<TurboquantHw> {
+  if (!turboquantHwMemo) {
+    const pending = probe()
+    turboquantHwMemo = pending
+    // An NVIDIA box whose driver version we could not read (nvidia-smi timed out, or the
+    // driver was mid-update) is not a stable answer: caching it would pin this machine to
+    // Vulkan — and, through needsTurboquantReprovision, could replace a working CUDA install —
+    // for the daemon's lifetime. Drop it once it settles so the next caller re-probes.
+    void pending.then(
+      (hw) => { if (hw.vendor === 'nvidia' && hw.driverCuda === null) turboquantHwMemo = null },
+      () => { turboquantHwMemo = null },
+    )
+  }
   return turboquantHwMemo
 }
 
@@ -1059,11 +1082,22 @@ async function backendLoads(bin: string, variant: TurboquantVariant): Promise<bo
  *  Vulkan/CPU/Metal build runs anywhere its platform allows and is never replaced, and neither
  *  is an install on a machine whose GPU has merely stopped being visible: candidates collapse
  *  to the CPU build then, and an unreadable `nvidia-smi` must never delete a working GPU
- *  install. Marker-less installs have nothing to compare and are left alone too. */
-export function needsTurboquantReprovision(marker: TurboquantMarker | null, candidates: TurboquantVariant[]): boolean {
+ *  install. `hw` makes the same call for the other shape of an unreadable probe — an NVIDIA
+ *  machine whose DRIVER VERSION could not be read (the GPU is still visible, so the candidates
+ *  collapse to Vulkan, which would replace a working CUDA build on a failed probe).
+ *  Marker-less installs have nothing to compare and are left alone too. */
+export function needsTurboquantReprovision(
+  marker: TurboquantMarker | null,
+  candidates: TurboquantVariant[],
+  hw?: TurboquantHw,
+): boolean {
   const installed = marker?.variant ? turboquantBackend(marker.variant) : null
   if (!installed || installed === 'cpu') return false
   if (candidates.length === 1 && turboquantBackend(candidates[0].name) === 'cpu') return false
+  // "The driver version is unknown" is not "there is no CUDA build for this machine": on an
+  // NVIDIA box that is the probe having failed, and acting on it costs the user their CUDA
+  // install (and a ~500 MB Vulkan download) until nvidia-smi answers again.
+  if (hw?.vendor === 'nvidia' && hw.driverCuda === null) return false
   return !candidates.some((c) => turboquantBackend(c.name) === installed)
 }
 
@@ -1094,6 +1128,11 @@ async function installTurboquantVariant(
     { name: resolved.assetName, url: resolved.url, sha256: sha256Of(resolved.digest) },
   ]
   if (resolved.variant.cudartPack) archives.push(await runtimePackArchive(resolved.variant.cudartPack, signal))
+  // Older fork releases publish no per-asset digest, so a download from them is size-checked
+  // but not checksum-verified. Say so instead of implying a guarantee that isn't there.
+  for (const archive of archives) {
+    if (!archive.sha256) console.warn(`[turboquant] ${archive.name} carries no published sha256 — this download cannot be checksum-verified`)
+  }
 
   mkdirSync(destDir, { recursive: true })
   const parts = archives.length
@@ -1119,6 +1158,10 @@ async function installTurboquantVariant(
 
   const bin = findServer(destDir)
   if (!bin) throw new Error('llama-server not found in extracted TurboQuant archive')
+  // A `.tar.gz` carries the mode, but the pure-Node zip path writes plain files (the same
+  // reason release-install.ts chmods after extracting) — a Linux machine falling back to a
+  // .zip asset would otherwise get a binary it cannot run.
+  if (process.platform !== 'win32') chmodSync(bin, 0o755)
   writeFileSync(
     join(destDir, PROVISION_MARKER),
     JSON.stringify({ tag: resolved.tag, variant: resolved.variant.name, assets: archives.map((a) => a.name) }),
@@ -1126,17 +1169,42 @@ async function installTurboquantVariant(
   return bin
 }
 
+/** Swap a fully-installed staging dir in as the live install: park the old dir, rename the new
+ *  one in, then delete the old — never a moment where neither exists, and the parked dir is
+ *  renamed back if the swap itself fails (on Windows a just-probed .exe can stay locked by
+ *  antivirus for a moment: EPERM/EBUSY). Mirrors zip-install's promoteProbedInstall. */
+function promoteTurboquantStaging(enginesRoot: string, stageDir: string, destDir: string): void {
+  const parked = existsSync(destDir) ? join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.old`) : null
+  if (parked) renameSync(destDir, parked)
+  try {
+    renameSync(stageDir, destDir)
+  } catch (e) {
+    if (parked) renameSync(parked, destDir)
+    throw e
+  }
+  if (parked) {
+    try {
+      rmSync(parked, { recursive: true, force: true })
+    } catch {
+      /* best effort — the new install is already in place */
+    }
+  }
+}
+
 /** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`: resolve the
  *  newest release that fits this machine, then download → extract (plus the CUDA runtime pack
  *  when the variant needs one) → locate → verify the backend it promised actually loads.
  *
  *  The plan is walked in order, so a build that installs but whose backend doesn't come up
- *  falls through to the next candidate (CUDA 13.3 → CUDA 12.4 → Vulkan) instead of leaving a
- *  silent CPU-only install behind. Throws `no_release_asset` when no prebuilt fits at all.
+ *  falls through to the next candidate (CUDA 13.3 → CUDA 12.4 → Vulkan → CPU), and the LAST
+ *  candidate is kept with a warning rather than thrown away: a machine with nothing left to
+ *  try is better off with a build that runs (ggml falls back to the CPU) than with no engine
+ *  at all. Throws `no_release_asset` when no prebuilt fits at all.
  *
  *  `force` re-installs even though a complete install is already there — what the update path
  *  wants, having already decided the installed tag is behind. It still resolves before deleting
- *  anything, so a failed lookup leaves the old build exactly where it was. */
+ *  anything, and every candidate is built and checked in a staging dir that is only swapped in
+ *  once it passed, so a failed forced update leaves the old build exactly where it was. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
@@ -1148,7 +1216,7 @@ export async function provisionTurboquant(
   const destDir = join(enginesRoot, 'turboquant')
   const hardware = hw ?? (await detectTurboquantHw())
   const existing = installedTurboquant(destDir)
-  if (existing && !force && !needsTurboquantReprovision(readTurboquantMarker(destDir), turboquantCandidates(hardware))) {
+  if (existing && !force && !needsTurboquantReprovision(readTurboquantMarker(destDir), turboquantCandidates(hardware), hardware)) {
     // Strip quarantine even on the fast-path: a previous failed probe leaves the
     // directory intact with the quarantine attribute still set.
     stripMacOsQuarantine(destDir)
@@ -1158,30 +1226,47 @@ export async function provisionTurboquant(
   // destroy an install that is sitting there working.
   const plan = await fetchTurboquantPlan(repo, hardware, signal)
   if (!plan.length) throw new NoReleaseAssetError()
-  rmSync(destDir, { recursive: true, force: true }) // an incomplete earlier install, or a variant this machine can't run
-
+  // Each candidate is downloaded, extracted and backend-checked in a hidden staging sibling
+  // (the probe runs against the staging path), and only the winner is swapped in — so a
+  // download, checksum, extraction or backend failure on EVERY candidate leaves the working
+  // install untouched. The install dir used to be removed up front and again per failure,
+  // which is how a failed forced update took the engine away with it, leaving the registry
+  // pointing at a binary that no longer existed.
+  // Staged under build/ in the `.stage` convention release-install and zip-install use: same
+  // naming, same volume (so the final rename is atomic), and gcAbandonedZipInstalls sweeps one
+  // a hard kill left behind — age alone decides, since a staging dir never holds a registered
+  // binary.
+  const stageDir = join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.stage`)
   let lastError: unknown = null
-  for (const resolved of plan) {
-    try {
-      const bin = await installTurboquantVariant(enginesRoot, destDir, resolved, onProgress, signal)
-      // Only verify when there's an alternative to fall back to: a single-candidate machine
-      // (Apple Silicon's Metal build) can do no better than the install it just made, so
-      // failing it over an unverifiable probe could only break it.
-      if (plan.length > 1 && !(await backendLoads(bin, resolved.variant))) {
-        throw new Error(`the ${resolved.variant.name} build did not load its ${turboquantBackend(resolved.variant.name)} backend`)
+  try {
+    for (const [i, resolved] of plan.entries()) {
+      try {
+        rmSync(stageDir, { recursive: true, force: true })
+        const stagedBin = await installTurboquantVariant(enginesRoot, stageDir, resolved, onProgress, signal)
+        if (!(await backendLoads(stagedBin, resolved.variant))) {
+          const backend = turboquantBackend(resolved.variant.name)
+          // Not the last candidate: fall through to the next one. The last one is kept — the
+          // CPU-family variants pass this check by definition, so what lands here is a GPU
+          // build on a machine with no fallback left.
+          if (i < plan.length - 1) {
+            throw new Error(`the ${resolved.variant.name} build did not load its ${backend} backend`)
+          }
+          console.warn(`[turboquant] ${resolved.variant.name} is the last build available for this machine and its ${backend} backend did not come up — keeping it (ggml will fall back to the CPU)`)
+        }
+        promoteTurboquantStaging(enginesRoot, stageDir, destDir)
+        const bin = findServer(destDir)
+        if (!bin) throw new Error('llama-server vanished from the TurboQuant install dir after the swap')
+        return bin
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') throw e
+        lastError = e
       }
-      return bin
-    } catch (e) {
-      if ((e as Error)?.name === 'AbortError') {
-        rmSync(destDir, { recursive: true, force: true })
-        throw e
-      }
-      lastError = e
-      rmSync(destDir, { recursive: true, force: true })
     }
+    throw new Error(
+      `no TurboQuant build for this machine worked (tried ${plan.map((p) => p.variant.name).join(', ')}): ` +
+        `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    )
+  } finally {
+    rmSync(stageDir, { recursive: true, force: true }) // a no-op once it was renamed into place
   }
-  throw new Error(
-    `no TurboQuant build for this machine worked (tried ${plan.map((p) => p.variant.name).join(', ')}): ` +
-      `${lastError instanceof Error ? lastError.message : String(lastError)}`,
-  )
 }

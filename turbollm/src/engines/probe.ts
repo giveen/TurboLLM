@@ -98,15 +98,18 @@ export function parseDeviceNames(out: string): string[] | null {
  *  the longer macOS first-run budget: Metal JIT-compiles its shaders).
  *
  *  Three outcomes: the device names, `[]` when the binary answered with nothing runnable (its
- *  `(none)` answer, or a crash/timeout with no output at all), and `null` when it exited
- *  cleanly with an output we can't read — an older build whose format we must not judge. A
- *  binary that doesn't know the flag at all lands in the `null` bucket: llama.cpp's parser
- *  answers "invalid argument: --list-devices" and exits non-zero. */
+ *  `(none)` answer, or a crash with no output at all), and `null` when the answer must not be
+ *  judged — an older build whose output format we don't read, a binary that doesn't know the
+ *  flag ("invalid argument: --list-devices"), or a run that hit the timeout. A timeout is
+ *  "cannot tell", never "no device": a first-run antivirus scan can stall a perfectly good
+ *  binary past the budget, and counting that as an answer makes the TurboQuant installer
+ *  discard a working build and download ~500 MB of alternatives. */
 export async function listDevices(bin: string): Promise<string[] | null> {
   const { out, err } = await runCaptured(bin, '--list-devices')
   const devices = parseDeviceNames(out)
   if (devices) return devices
   if (/invalid argument|unknown argument|unrecognized/i.test(out)) return null
+  if (isTimeout(err)) return null
   return err || !out.trim() ? [] : null
 }
 
