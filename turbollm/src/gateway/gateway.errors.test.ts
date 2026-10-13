@@ -21,7 +21,7 @@ function fakeDeps(target = 'http://engine.invalid.local:1'): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), dir: () => '/tmp/turbollm-test-data' },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => target,
@@ -317,4 +317,13 @@ test('POST /v1/messages (streaming) with an already-aborted client signal report
   assert.equal(evt.event, 'error')
   const parsed = JSON.parse(evt.data) as { error: { type: string; message: string } }
   assert.equal(parsed.error.message, 'Client disconnected before the engine responded.')
+})
+
+test('describeEngineError: the redactor is applied to both the structured and the raw message', async () => {
+  const { describeEngineError } = await import('./gateway')
+  const redact = (t: string) => t.replace('/secret/model.gguf', '<model>')
+  const structured = new Response(JSON.stringify({ error: { message: 'failed to open /secret/model.gguf', type: 'x' } }), { status: 500 })
+  assert.equal((await describeEngineError(structured, redact)).message, 'failed to open <model>')
+  const raw = new Response('panic at /secret/model.gguf', { status: 500 })
+  assert.equal((await describeEngineError(raw, redact)).message, 'panic at <model>')
 })

@@ -34,11 +34,11 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -48,8 +48,15 @@ jobs:
       # Trusted publishing needs a recent npm CLI (11.5.1+) — Node 22's bundled
       # npm may lag behind that on an older runner image, so pin it explicitly
       # rather than trust whatever setup-node happened to bring.
+      #
+      # Pinned to the 12.x major instead of `npm@latest`: this job publishes with an
+      # OIDC identity and no NODE_AUTH_TOKEN, and setup-node (v7 here) writes
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into .npmrc whenever
+      # registry-url is set. How an empty expansion is tolerated is npm-CLI behaviour,
+      # so leaving the CLI unpinned meant the thing that decides whether the publish
+      # authenticates could jump a major without any change in this repo.
       - name: Ensure npm supports OIDC trusted publishing
-        run: npm install -g npm@latest
+        run: npm install -g npm@12
 
       - name: Install dependencies
         run: npm ci

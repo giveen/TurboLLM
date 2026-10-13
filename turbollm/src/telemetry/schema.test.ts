@@ -128,7 +128,7 @@ test('validateEvent: ui_action accepts the Phase 6c ModelsScreen batch actions',
     'switch_models_tab', 'filter_models', 'open_model_folders', 'rescan_models', 'toggle_incompatible_models',
     'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
     'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
-    'browse_model_dir', 'add_model_dir',
+    'browse_model_dir', 'add_model_dir', 'import_model_file',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))
@@ -960,5 +960,13 @@ test('validateEvent: engine_installed accepts every provisioning trigger, includ
   for (const trigger of ['seed', 'user_install', 'user_update', 'runtime_env', 'build', 'auto_update']) {
     const r = validateEvent(validEvent({ event: 'engine_installed', payload: { outcome: 'ok', trigger } }))
     assert.equal(r.ok, true, `${trigger} must validate — ${r.ok === false ? r.reason : ''}`)
+  }
+})
+
+test('validateEvent: ui_action accepts the release-source actions', () => {
+  const actions = ['open_release_source', 'install_release_asset', 'update_release_engine', 'install_prebuilt_from_card']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `engines/${action}: ${r.reason}` : '')
   }
 })

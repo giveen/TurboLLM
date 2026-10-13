@@ -383,3 +383,44 @@ test('a complete turn still prefers the engine usage/timings numbers over the fa
     h.cleanup()
   }
 })
+
+// ── 5. Engine errors inside a 200 stream, and in a non-OK body ────────────────
+
+test('an in-stream {"error": …} chunk ends the turn with the engine\'s message and keeps the text so far', async () => {
+  const h = mkHarness()
+  const f = fakeUpstream(async (c) => {
+    const s = c as Scripted
+    s.write(sseLine({ choices: [{ delta: { content: 'Partial' } }] }))
+    await tick()
+    s.write('event: response.error\n' + sseLine({ error: `RuntimeError: GPU lost while reading ${h.d.store.dir()}/models/x.litertlm` }))
+  })
+  const events: Array<{ event: string; data: unknown }> = []
+  try {
+    const seeded = seed(h.store)
+    await runGeneration(h.d, (ev) => { events.push(ev) }, ctxFor(seeded, new AbortController()) as never)
+    const err = events.find((e) => e.event === 'error')?.data as { code: string; message: string } | undefined
+    assert.equal(err?.code, 'engine_error')
+    assert.match(err!.message, /GPU lost/)
+    assert.ok(!err!.message.includes(h.d.store.dir()), 'the data dir is redacted from what clients see')
+    assert.equal(h.store.getMessage(seeded.assistantMsg.id)!.content, 'Partial')
+  } finally {
+    f.restore()
+    h.cleanup()
+  }
+})
+
+test('a non-OK engine response reports the reason from its body, not just the status', async () => {
+  const h = mkHarness()
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({ object: 'error', message: 'context length exceeded' }), { status: 400 })) as unknown as typeof fetch
+  const events: Array<{ event: string; data: unknown }> = []
+  try {
+    const seeded = seed(h.store)
+    await runGeneration(h.d, (ev) => { events.push(ev) }, ctxFor(seeded, new AbortController()) as never)
+    const err = events.find((e) => e.event === 'error')?.data as { message: string } | undefined
+    assert.equal(err?.message, 'Engine returned 400: context length exceeded')
+  } finally {
+    globalThis.fetch = original
+    h.cleanup()
+  }
+})

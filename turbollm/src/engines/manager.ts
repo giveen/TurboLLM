@@ -17,6 +17,7 @@ import { slotCacheDir } from './slot-cache'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
 import {
+  isNativeLitertLm,
   litertLmConfigPath,
   litertLmLoadFailureMessage,
   litertLmPathBlocker,
@@ -335,7 +336,9 @@ export class Manager {
       // and the probe spawns a fresh Python process that dlopens the native library —
       // noticeable on a phone. The result is stable for an unchanged venv, so it is cached
       // per interpreter + installed-package mtime and only re-run after a reinstall.
-      const blocker = litertLmPathBlocker(opts.modelPath) ?? (await litertLmServeBlockerCached(opts.engine.binPath))
+      // The Android app's native server has no interpreter to probe; its library is checked when the APK is built.
+      const blocker = litertLmPathBlocker(opts.modelPath) ??
+        (isNativeLitertLm(opts.engine.binPath) ? null : await litertLmServeBlockerCached(opts.engine.binPath))
       if (blocker) {
         this.state = 'error'
         this.errInfo = { code: 'engine_unsupported', message: blocker, exitCode: -1, logTail: [] }
@@ -885,7 +888,9 @@ const READINESS_TIMEOUT_MS = 600_000
  *     CacheNotFound when `~/.cache/huggingface/hub` is absent, and
  *   - on WSL, run vLLM's V1 model runner, since V2 cannot start there (`vllmModelRunnerEnv`). */
 export function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
-  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang' && kind !== 'litert-lm' && kind !== 'laya') {
+  const python = kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang' ||
+    kind === 'laya' || (kind === 'litert-lm' && !isNativeLitertLm(binPath))
+  if (!python) {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
     // Append the existing value only if it's non-empty — glibc's dynamic linker treats an
@@ -901,6 +906,10 @@ export function pyEngineEnv(kind: string, dataDir: string, binPath: string): Nod
       const dyld = process.env.DYLD_LIBRARY_PATH
       env.DYLD_LIBRARY_PATH = dyld ? `${dir}:${dyld}` : dir
     }
+    // The native LiteRT-LM server keeps its compiled-model cache (XNNPACK weight packing, GPU programs) next to the
+    // model, so a reload skips that work. A model in a folder it cannot write to would recompile on every load; this
+    // directory is where it caches instead.
+    if (kind === 'litert-lm') env.TURBOLLM_LITERT_CACHE_DIR = join(dataDir, 'cache', 'litert-lm')
     return env
   }
   const hfHome = join(dataDir, 'hf-cache')

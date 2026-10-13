@@ -51,6 +51,7 @@ function mkDeps(keys: ApiKey[], opts?: { state?: string; err?: unknown }): Deps 
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     manager: {
+      currentOpts: () => null,
       status: () => ({
         state: opts?.state ?? 'running',
         err: opts?.err ?? null,

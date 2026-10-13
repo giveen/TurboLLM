@@ -23,7 +23,8 @@ import {
 } from 'lucide-react'
 import { ApiError, deleteModel, track } from '../lib/api'
 import { useModelLoader } from '../lib/model-loader'
-import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
+import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus, useSysInfo } from '../lib/queries'
+import { importModelFiles } from '../lib/android-app'
 import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { useDocumentScroll } from '../lib/scroll-mode'
@@ -526,6 +527,9 @@ function LibraryTab({
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
 }) {
+  // Inside the packaged Android app: model files in shared storage cannot be read, so they are imported instead.
+  const inAndroidApp = !!useSysInfo().data?.bundledEnginesOnly
+  const importFiles = () => { track('models', 'import_model_file'); importModelFiles() }
   const facets = (
     [
       { id: 'vision', label: 'Vision', count: facetCounts.vision },
@@ -610,6 +614,19 @@ function LibraryTab({
       {/* A linked machine that contributed no rows still says why. */}
       <MachineNotes machines={machines} />
 
+      {/* Above a non-empty library only; an empty one says the same in its own empty state. */}
+      {inAndroidApp && models.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-panel px-4 py-3">
+          <span className="text-[13px] text-muted">
+            Android doesn&apos;t let the app read model files in shared folders such as /sdcard/AI. Import them instead:
+            they&apos;re copied into the app&apos;s own storage.
+          </span>
+          <Button size="sm" onClick={importFiles}>
+            <FolderPlus size={14} /> Import model file
+          </Button>
+        </div>
+      )}
+
       {modelsQ.isLoading ? (
         <div className="flex flex-col gap-2">
           {[0, 1, 2].map((i) => (
@@ -626,14 +643,20 @@ function LibraryTab({
         <EmptyState
           icon={<Boxes size={24} />}
           message={
-            dirs.length === 0
-              ? 'No model folders yet. Add a folder to discover the GGUF models you already have.'
-              : scanning
-                ? 'Scanning your folders…'
-                : 'No GGUF models found in your folders.'
+            scanning
+              ? 'Scanning your folders…'
+              : inAndroidApp
+                ? 'No models in the app yet. Import a .gguf or .litertlm file from your phone, or download one from Discover.'
+                : dirs.length === 0
+                  ? 'No model folders yet. Add a folder to discover the GGUF models you already have.'
+                  : 'No GGUF models found in your folders.'
           }
           action={
-            dirs.length === 0 ? (
+            inAndroidApp ? (
+              <Button size="sm" onClick={importFiles}>
+                <FolderPlus size={14} /> Import model file
+              </Button>
+            ) : dirs.length === 0 ? (
               <Button size="sm" onClick={trackOpenFolders}>
                 <FolderPlus size={14} /> Add a folder
               </Button>

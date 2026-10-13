@@ -33,7 +33,8 @@ import {
   writeRunState,
 } from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
-import { seedDefaultEngines, ensureAndroidBundledEngine } from './engines/seed'
+import { engineWorkBusy } from './api/routes'
+import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir } from './engines/seed'
 import { runAutoLoad } from './engines/auto-load'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
@@ -391,6 +392,7 @@ const scanner = new Scanner(store)
 // exists, adopt it as the default so pre-existing HF models show up. One-time only;
 // triggers its own rescan. Must run BEFORE the background rescan below.
 seedDefaultModelDir(store, scanner)
+ensureAndroidModelsDir(store) // the app's imported-models folder; no-op elsewhere
 const initialScan = scanner.rescan() // discover models in the background; never rejects, awaited by auto-load
 const hashes = new HashStore(store.dir())
 // Android only: sql.js's WASM module must finish loading before the first ConversationStore
@@ -920,7 +922,7 @@ const updateScheduler = new UpdateScheduler({
   updates,
   applyUpdate: async (engine) => {
     if (comfy.isBlocked()) return // ComfyUI owns the GPU — don't swap engines under it
-    await applyEngineUpdate({ store, registry, manager, provision }, engine)
+    await applyEngineUpdate({ store, registry, manager, provision, updates, modelRouter, workBusy: () => engineWorkBusy(deps) }, engine)
   },
 })
 updateScheduler.start()

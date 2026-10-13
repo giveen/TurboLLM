@@ -21,6 +21,10 @@ export interface SysInfo {
   os: string
   cpu: string
   cores: number
+  /** Cores worth running inference threads on, on a big.LITTLE CPU: the ones within half the fastest core's capacity
+   *  (a Tensor G4's 1 + 3 of 1 + 3 + 4). Absent when the cores are all alike or sysfs says nothing — the caller then
+   *  falls back to half the logical cores. See `autoThreadCount`. */
+  perfCores?: number
   ramMB: number
   gpus: GpuInfo[]
   /** True inside the packaged Android app, where the engines that exist are the ones shipped in
@@ -47,6 +51,7 @@ export function getSysInfo(): SysInfo {
     os: `${process.platform}/${process.arch}`,
     cpu: getCpuModel(),
     cores: getCpuCoreCount(),
+    perfCores: detectPerfCores(),
     ramMB: Math.round(os.totalmem() / 1e6),
     gpus: detectGpus(),
     // The app hands us its nativeLibraryDir (MainActivity.kt) because that is the only directory
@@ -406,6 +411,8 @@ function enumLinuxGpus(): GpuInfo[] {
   // already keys its own registration off of.
   const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (process.platform === 'android' && nativeLibDir) {
+    const fromApp = packagedAppGpu(process.platform, process.env)
+    if (fromApp) return [fromApp]
     const vkBin = `${nativeLibDir}/libllama_server_vk.so`
     if (!fs.existsSync(vkBin)) return []
     try {
@@ -475,6 +482,17 @@ function enumVulkanGpus(): GpuInfo[] {
   } catch {
     return []
   }
+}
+
+/** The GPU the Android app names for the daemon, or null. The app reads it from a GL context before starting the
+ *  daemon (MainActivity.gpuEnv): the packaged-app counterpart of Termux's vulkaninfo, and the signal LiteRT-LM's "auto"
+ *  backend needs to pick the GPU. Preferred over running the bundled Vulkan engine with --list-devices: it costs nothing
+ *  at boot and works when that engine isn't shipped. Unified memory, so the budget is the same half of RAM the Termux
+ *  path assumes. Only the packaged app sets these variables; anywhere else this is null. */
+export function packagedAppGpu(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): GpuInfo | null {
+  if (platform !== 'android' || !env.TURBOLLM_ANDROID_NATIVE_LIB_DIR) return null
+  const name = env.TURBOLLM_ANDROID_GPU?.trim()
+  return name ? makeVulkanGpu(name, 'PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU') : null
 }
 
 function makeVulkanGpu(name: string, deviceType: string): GpuInfo {
@@ -688,6 +706,12 @@ function readKfdNodes(): KfdGpuNode[] {
 function getCpuModel(): string {
   const model = os.cpus()[0]?.model?.trim()
   if (model && model.length > 0) return model
+  if (process.platform === 'android') {
+    // arm64 /proc/cpuinfo names no SoC, and apps may not read it at all. The app passes Build.SOC_MODEL; Termux
+    // has getprop. Both give e.g. "Google Tensor G4".
+    const soc = androidSocName()
+    if (soc) return soc
+  }
   // Android /proc/cpuinfo usually has a "Hardware" or "model name" line.
   // Note: Node reports `process.platform === 'android'` on Termux/Android — distinct
   // from 'linux' (see NodeJS.Platform type) — so we must include it here, otherwise
@@ -706,8 +730,100 @@ function getCpuModel(): string {
   return model ?? ''
 }
 
+/** The thread count an "Auto" threads setting resolves to. On a phone, a thread on an efficiency core finishes its
+ *  share of every matmul last and the whole step waits for it, so decode gets slower, not faster, with more threads
+ *  than performance cores. Elsewhere: half the logical cores (SMT siblings share an FPU), as before. */
+export function autoThreadCount(sys: Pick<SysInfo, 'cores' | 'perfCores'>): number {
+  if (sys.perfCores && sys.perfCores > 0) return sys.perfCores
+  return sys.cores > 0 ? Math.max(1, Math.floor(sys.cores / 2)) : 0
+}
+
+/** Count the performance cores from per-core speeds (`cpu_capacity`, else `cpuinfo_max_freq`): those at or above half
+ *  the fastest. Null when the cores are homogeneous (nothing to gain over the default) or nothing was readable. */
+export function perfCoresFromSpeeds(speeds: number[]): number | null {
+  const known = speeds.filter((v) => Number.isFinite(v) && v > 0)
+  if (known.length < 2) return null
+  const max = Math.max(...known)
+  const fast = known.filter((v) => v >= max / 2).length
+  return fast < known.length ? fast : null
+}
+
+function detectPerfCores(): number | undefined {
+  if (process.platform !== 'android' && process.platform !== 'linux') return undefined
+  if (process.arch !== 'arm64') return undefined // x86 hybrids (P/E cores) keep the established default
+  const read = (cpu: string, file: string): number => {
+    try {
+      return Number(fs.readFileSync(`/sys/devices/system/cpu/${cpu}/${file}`, 'utf8').trim())
+    } catch {
+      return NaN
+    }
+  }
+  let cpus: string[]
+  try {
+    cpus = fs.readdirSync('/sys/devices/system/cpu').filter((d) => /^cpu\d+$/.test(d))
+  } catch {
+    return undefined
+  }
+  for (const file of ['cpu_capacity', 'cpufreq/cpuinfo_max_freq']) {
+    const n = perfCoresFromSpeeds(cpus.map((c) => read(c, file)))
+    if (n !== null) return n
+  }
+  return undefined
+}
+
+/** Memory a new allocation can actually get, in bytes. Linux's MemFree leaves out the page cache the kernel drops on
+ *  demand, and Android keeps that cache nearly full, so `os.freemem()` (MemFree, under Node 18's libuv) shows a phone
+ *  with gigabytes to spare as almost out of RAM. MemAvailable is the kernel's own estimate that counts it. */
+export function availableMemBytes(meminfo?: string): number {
+  if (meminfo !== undefined || process.platform === 'linux' || process.platform === 'android') {
+    try {
+      const text = meminfo ?? fs.readFileSync('/proc/meminfo', 'utf8')
+      const m = text.match(/^MemAvailable:\s+(\d+)\s+kB/m)
+      if (m) return Number(m[1]) * 1024
+    } catch {
+      /* fall through */
+    }
+  }
+  return os.freemem()
+}
+
+function androidSocName(): string {
+  const fromApp = process.env.TURBOLLM_ANDROID_SOC?.trim()
+  if (fromApp) return fromApp
+  const prop = (name: string): string => {
+    try {
+      return execFileSync('getprop', [name], { timeout: 2000 }).toString().trim()
+    } catch {
+      return ''
+    }
+  }
+  const model = prop('ro.soc.model')
+  if (!model) return ''
+  const maker = prop('ro.soc.manufacturer')
+  return maker && !model.toLowerCase().startsWith(maker.toLowerCase()) ? `${maker} ${model}` : model
+}
+
+/** The CPUs physically present ("0-7"), counted. `nproc` and os.cpus() count only the CPUs this process may run on,
+ *  and an Android app's cpuset leaves some out, so the phone showed 7 cores instead of 8. */
+export function countCpuList(list: string): number {
+  let n = 0
+  for (const part of list.trim().split(',')) {
+    const m = part.match(/^(\d+)(?:-(\d+))?$/)
+    if (m) n += m[2] ? Number(m[2]) - Number(m[1]) + 1 : 1
+  }
+  return n
+}
+
 /** Android/Termux fallback for CPU core count, as os.cpus() often reports 1 due to cgroups. */
 function getCpuCoreCount(): number {
+  if (process.platform === 'android') {
+    try {
+      const n = countCpuList(fs.readFileSync('/sys/devices/system/cpu/present', 'utf8'))
+      if (n > 0) return n
+    } catch {
+      /* fall through */
+    }
+  }
   const cpus = os.cpus()
   if (cpus.length > 1) return cpus.length
   // Fallback 1: nproc (available in Termux)

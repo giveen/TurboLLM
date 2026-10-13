@@ -14,7 +14,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import os from 'node:os'
-import { getSysInfo, type SysInfo } from './sysinfo'
+import { availableMemBytes, getSysInfo, type SysInfo } from './sysinfo'
 import {
   type CpuTimes,
   type DiskCounters,
@@ -298,6 +298,44 @@ function wddmReader(): GpuReader {
   )
 }
 
+/** Where Android kernels publish GPU load, most specific first. Which one exists, and whether an app's SELinux domain
+ *  may read it, depends on the vendor kernel, so every candidate is tried and the reader latches off if none reads. */
+export const ANDROID_GPU_LOAD_PATHS = [
+  '/sys/kernel/gpu/gpu_busy', // Pixel (Tensor) and Exynos Mali: "37 %"
+  '/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage', // Adreno: "37 %"
+  '/sys/class/misc/mali0/device/utilization', // mainline-style Mali kbase: "37"
+  '/sys/class/misc/mali0/device/utilisation',
+  '/sys/class/misc/mali0/device/gpu_busy',
+  '/sys/class/devfreq/gpufreq/load', // MediaTek: "37@850000000Hz"
+]
+
+/** The leading integer of a load file, as a percentage. Null for anything else, never a guessed 0. */
+export function parseGpuLoad(text: string): number | null {
+  const m = text.trim().match(/^(\d+(?:\.\d+)?)/)
+  if (!m) return null
+  const v = Number(m[1])
+  return v >= 0 && v <= 100 ? v : null
+}
+
+function androidGpuReader(sys: SysInfo): GpuReader {
+  const name = sys.gpus[0]?.name ?? 'GPU'
+  let path: string | null = null
+  return createLatchingReader('android', async () => {
+    for (const p of path ? [path] : ANDROID_GPU_LOAD_PATHS) {
+      try {
+        const pct = parseGpuLoad(readFileSync(p, 'utf8'))
+        if (pct === null) continue
+        path = p
+        return [{ id: '0', name, utilPct: pct, vramUsedMb: null, vramTotalMb: null, vramSharedMb: null }]
+      } catch {
+        /* absent or not readable by this app */
+      }
+    }
+    path = null
+    return null
+  })
+}
+
 function nullReader(): GpuReader {
   return { kind: 'null', start: () => {}, read: async () => null, stop: () => {} }
 }
@@ -427,8 +465,55 @@ export function pickReader(sys: SysInfo): GpuReader {
   if (process.platform === 'darwin') return ioregReader()
   if (process.platform === 'linux' && gpus.some((g) => g.vendor === 'amd')) return amdReader()
   if (process.platform === 'win32') return wddmReader()
+  if (process.platform === 'android') return androidGpuReader(sys)
   // Linux + Intel has no consistent reader across i915/xe. Fail open rather than guess.
   return nullReader()
+}
+
+// ── CPU ──────────────────────────────────────────────────────────────────────
+
+/** Whole-machine CPU times, from /proc/stat via os.cpus(). An Android app may not read /proc/stat (SELinux, Android
+ *  8+), so os.cpus() comes back with zeroed times there and the CPU bar never filled. In that case the times are
+ *  this app's own processes instead: the daemon plus the engines it runs, which during inference is nearly all of
+ *  the load. Shared Android /proc only shows an app its own processes, so that sum is exactly "TurboLLM's CPU". */
+function cpuTimesNow(): CpuTimes {
+  const machine = sumCpuTimes(os.cpus())
+  if (machine.total > 0 || process.platform !== 'android') return machine
+  const ticks = ownProcessTicks()
+  if (ticks === null) return machine
+  const cores = getSysInfo().cores || 1
+  // Same units as os.cpus() (ms): clock ticks are 10 ms on Android, and the wall time is spread over every core.
+  const total = Date.now() * cores
+  return { idle: total - ticks * 10, total }
+}
+
+/** utime + stime of every process visible in /proc, in clock ticks. Null when /proc cannot be listed. */
+export function ownProcessTicks(procRoot = '/proc'): number | null {
+  let pids: string[]
+  try {
+    pids = readdirSync(procRoot).filter((n) => /^\d+$/.test(n))
+  } catch {
+    return null
+  }
+  let ticks = 0
+  for (const pid of pids) {
+    try {
+      const stat = readFileSync(`${procRoot}/${pid}/stat`, 'utf8')
+      ticks += procStatTicks(stat)
+    } catch {
+      /* exited, or not ours */
+    }
+  }
+  return ticks
+}
+
+/** utime + stime from one /proc/<pid>/stat line. The command name may contain spaces and parentheses, so the
+ *  fields are counted from the last ')'. */
+export function procStatTicks(stat: string): number {
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+  const utime = Number(fields[11])
+  const stime = Number(fields[12])
+  return (Number.isFinite(utime) ? utime : 0) + (Number.isFinite(stime) ? stime : 0)
 }
 
 // ── the loop ─────────────────────────────────────────────────────────────────
@@ -475,7 +560,7 @@ async function tick(): Promise<HwUsage> {
   if (inFlight && latest) return latest
   inFlight = true
   try {
-    const cur = sumCpuTimes(os.cpus())
+    const cur = cpuTimesNow()
     const cpuPct = cpuPctFromTimes(prevCpu, cur)
     prevCpu = cur
 
@@ -496,7 +581,7 @@ async function tick(): Promise<HwUsage> {
     latest = {
       cpuPct,
       ram: {
-        usedMb: Math.round((os.totalmem() - os.freemem()) / 1e6),
+        usedMb: Math.round((os.totalmem() - availableMemBytes()) / 1e6),
         totalMb: Math.round(os.totalmem() / 1e6),
       },
       gpus: mergeUsage(getSysInfo(), samples),

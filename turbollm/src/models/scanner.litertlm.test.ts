@@ -5,6 +5,7 @@ import { test, type TestContext } from 'node:test'
 import { defaultConfig, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
 import { tmpDir } from '../test-support/tmp'
+import { fakeLitertlmBundle } from '../test-support/litertlm-bundle'
 
 function scannerOver(t: TestContext): { library: string; scanner: Scanner } {
   const root = tmpDir('turbollm-litertlm-scan-')
@@ -49,4 +50,11 @@ test('a .litertlm in a subfolder is found and does not disturb neighbouring mode
   assert.equal(models.length, 1)
   assert.equal(models[0].format, 'litertlm')
   assert.equal(models[0].nativeCtx, 4096)
+})
+
+test('a bundle\'s header KV-cache length becomes the entry\'s nativeCtx, with no ekv tag in its name', async (t) => {
+  const { library, scanner } = scannerOver(t)
+  writeFileSync(join(library, 'LFM2.5-230M_int8.litertlm'), fakeLitertlmBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
+  await scanner.rescan()
+  assert.equal(scanner.list().models[0].nativeCtx, 4096)
 })

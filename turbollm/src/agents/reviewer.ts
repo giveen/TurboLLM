@@ -7,6 +7,7 @@
 // strip fences, exact model alias) so the loop can't silently degrade to NO_LESSON.
 import type { Deps } from '../deps'
 import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { servingEngineKind } from '../engines/serving'
 
 const REVIEWER_SYSTEM = `You review a COMPLETED, user-approved agent task and extract at most ONE reusable lesson — ONLY if there is concrete evidence of a problem.
 
@@ -37,13 +38,13 @@ export async function reviewConversation(
   if (ms.state !== 'running' || !ms.model || !target) return { lesson: null, evidence: null }
 
   const convoText = transcript.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n').slice(0, 24_000)
-  const model = engineModelAlias(d.registry.active()?.kind ?? '', d.manager.currentOpts()?.modelPath) ?? ms.model.key
+  const model = engineModelAlias(servingEngineKind(d), d.manager.currentOpts()?.modelPath) ?? ms.model.key
 
   try {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(applyEngineTokenLimit(d.registry.active()?.kind ?? '', {
+      body: JSON.stringify(applyEngineTokenLimit(servingEngineKind(d), {
         model,
         messages: [
           { role: 'system', content: REVIEWER_SYSTEM },

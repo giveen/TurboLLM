@@ -1,4 +1,4 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 
 // Real localStorage polyfill — NOT covered by vite.config.ts's jsdom `url` option. That option
 // fixes jsdom's OWN localStorage (which needs a non-opaque origin), but Node 22+'s experimental

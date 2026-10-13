@@ -26,6 +26,7 @@ import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
+import { servingEngineKind } from '../engines/serving'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER (16) — same headroom reasoning: a handful of
  *  web_search/fetch_url/run_code rounds plus a final answer round. A ceiling, not a target. */
@@ -170,7 +171,7 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
   const target = d.manager.target?.() ?? null
   if (ms.state !== 'running' || !ms.model || !target) return { status: 'errored', error: 'No model loaded.' }
 
-  const engineKind = d.registry.active()?.kind ?? ''
+  const engineKind = servingEngineKind(d)
   const baseToolDefs = d.tools ? (await d.tools.buildToolDefinitions()).filter((t) => agent.tools.includes(t.function.name)) : []
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
 

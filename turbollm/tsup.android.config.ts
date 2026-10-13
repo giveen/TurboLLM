@@ -26,8 +26,17 @@ export default defineConfig({
   // nodejs-mobile embeds Node **18.20.4**, not the 22 the desktop package targets. Building
   // this pass for node22 would emit syntax the phone's runtime cannot parse.
   target: 'node18',
-  // Bundle everything by default — the whole point of this pass.
-  noExternal: [/.*/],
+  // Bundle everything by default — the whole point of this pass. tsup checks `noExternal`
+  // BEFORE `external`, so this catch-all wins over every package in the `external` list below
+  // (see the note there). A package that must stay out of the bundle has to be excluded HERE,
+  // by lookahead, as puppeteer-core is.
+  //
+  // puppeteer-core: server-side artifact screenshots need an installed desktop Chrome, which a
+  // phone never has — findChrome() returns null and screenshotArtifact() bails before its
+  // dynamic import. Bundling it anyway drags in @puppeteer/browsers' yargs, whose ESM shim
+  // declares its own `__dirname` and collides with the banner's (a SyntaxError chunk). Left
+  // out, the import (if ever reached) just fails and the existing catch returns null.
+  noExternal: [/^(?!puppeteer-core(\/|$)).*/],
   // Bundling CommonJS packages into an ESM output leaves esbuild's `__require` shim in place,
   // and that shim THROWS for any require it could not resolve statically. undici does
   // `require('assert')` at load time, which crashed the app on first boot with:
@@ -52,6 +61,12 @@ export default defineConfig({
       'const __dirname = __tllmDirname(__filename);',
     ].join('\n'),
   },
+  // NOTE: the `noExternal` catch-all above takes precedence, so the package entries in this
+  // list do NOT keep anything out of the bundle (verified: sql.js is inlined into the
+  // sql-js-database chunk). `node:sqlite` stays external only because esbuild never bundles
+  // builtins on platform 'node'. The pi-* packages are absent from the output only because
+  // nothing the Android entry reaches imports them — if that ever changes, they WILL be
+  // bundled unless added to the `noExternal` lookahead.
   external: [
     // Built into Node 22 but ABSENT from the phone's Node 18 — sqlite-adapter.ts already
     // falls back to sql.js there. Left external so the `node:` specifier survives for the

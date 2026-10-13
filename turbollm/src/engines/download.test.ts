@@ -310,11 +310,11 @@ test('downloadFile: verifies a published sha256 and removes a file that fails it
   const dest = join(tmpDir('tllm-dl-'), 'engine.tar.gz')
   const good = createHash('sha256').update(bytes).digest('hex')
 
-  await downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, good)
+  await downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, globalThis.fetch, good)
   assert.deepEqual(readFileSync(dest), bytes)
 
   // A truncated/corrupted 530 MB engine archive is exactly what this exists to stop.
-  await assert.rejects(downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, '0'.repeat(64)), /checksum_failed/)
+  await assert.rejects(downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, globalThis.fetch, '0'.repeat(64)), /checksum_failed/)
   assert.equal(existsSync(dest), false, 'the corrupt download was removed')
 })
 

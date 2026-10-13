@@ -20,7 +20,7 @@ export interface AutoLoadDeps {
   /** The boot scan's promise (cli.ts). Never rejects (CoalescedRunner C4). */
   initialScan: Promise<void>
   store: Pick<ConfigStore, 'snapshot'>
-  registry: Pick<Registry, 'active'>
+  registry: Pick<Registry, 'active'> & Partial<Pick<Registry, 'litertLmEngine'>>
   comfy: Pick<ComfyGuard, 'isBlocked' | 'freeComfyUIBeforeLoad'>
   scanner: Pick<Scanner, 'get'>
   manager: Pick<Manager, 'load'>
@@ -44,6 +44,7 @@ export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
     plan = planAutoLoad({
       cfg,
       engine: deps.registry.active(),
+      litertLmEngine: deps.registry.litertLmEngine?.(),
       comfyBlocked: deps.comfy.isBlocked(),
       findModel: (key) => deps.scanner.get(key),
     })
@@ -74,6 +75,10 @@ export interface AutoLoadPlanInput {
   cfg: Config
   /** `registry.active()`. A resume loads onto the active engine, never `lastLoaded.engineId`. */
   engine: Engine | undefined
+  /** `registry.litertLmEngine()`: a `.litertlm` model resumes on it whichever engine is active, the way a manual
+   *  load routes it (registry.engineForModel). Without this the Android app, whose active engine is llama.cpp, skipped
+   *  its last LiteRT-LM model at every boot as engine-incompatible. */
+  litertLmEngine?: Engine
   /** `comfy.isBlocked()` */
   comfyBlocked: boolean
   findModel: (key: string) => ModelEntry | undefined
@@ -87,7 +92,7 @@ export function planAutoLoad(input: AutoLoadPlanInput): AutoLoadPlan {
   if (isPointedAtLinkedModel(cfg)) {
     return skipBecause({ code: 'remote-model-selected', selectedModel: cfg.selectedRemoteModel })
   }
-  return planLocalResume({ cfg, engine, findModel: input.findModel })
+  return planLocalResume({ cfg, engine, litertLmEngine: input.litertLmEngine, findModel: input.findModel })
 }
 
 export function skipLine(reason: AutoLoadSkipReason): string {
@@ -105,12 +110,13 @@ export function fallbackLine(reason: AutoLoadSkipReason, devModel: DevModel): st
 interface LocalResumeInput {
   cfg: Config
   engine: Engine
+  litertLmEngine?: Engine
   findModel: AutoLoadPlanInput['findModel']
 }
 
 type LastModelResolution =
   | { kind: 'none-recorded' }
-  | { kind: 'loadable'; entry: ModelEntry }
+  | { kind: 'loadable'; entry: ModelEntry; engine: Engine }
   | { kind: 'unresolved'; reason: AutoLoadSkipReason }
 
 type LastModelSkipReason = Extract<AutoLoadSkipReason, { modelKey: string }>
@@ -132,7 +138,7 @@ function isPointedAtLinkedModel(cfg: Config): boolean {
 function planLocalResume(input: LocalResumeInput): AutoLoadPlan {
   const { cfg, engine } = input
   const lastModel = resolveLastModel(input)
-  if (lastModel.kind === 'loadable') return { kind: 'load-model', entry: lastModel.entry, engine }
+  if (lastModel.kind === 'loadable') return { kind: 'load-model', entry: lastModel.entry, engine: lastModel.engine }
   if (cfg.devModel) return loadDevModel(cfg.devModel, engine, lastModel)
   if (lastModel.kind === 'unresolved') return skipBecause(lastModel.reason)
   return skipBecause({ code: 'nothing-to-load' })
@@ -143,18 +149,19 @@ function loadDevModel(devModel: DevModel, engine: Engine, lastModel: LastModelRe
   return { kind: 'load-dev-model', devModel, engine, fallbackFrom: lastModel.reason }
 }
 
-function resolveLastModel({ cfg, engine, findModel }: LocalResumeInput): LastModelResolution {
+function resolveLastModel({ cfg, engine: active, litertLmEngine, findModel }: LocalResumeInput): LastModelResolution {
   const modelKey = cfg.lastLoaded.modelKey
   if (!modelKey) return { kind: 'none-recorded' }
   const entry = findModel(modelKey)
   if (!entry) return unresolved({ code: 'model-not-in-library', modelKey })
   if (entry.incomplete || entry.parseError) return unresolved({ code: 'model-not-loadable', modelKey })
+  const engine = entry.format === 'litertlm' && active.kind !== 'litert-lm' && litertLmEngine ? litertLmEngine : active
   const detail = incompatibilityDetail(engine, entry)
   if (detail) {
     const { name: engineName, kind: engineKind } = engine
     return unresolved({ code: 'engine-incompatible', modelKey, engineName, engineKind, detail })
   }
-  return { kind: 'loadable', entry }
+  return { kind: 'loadable', entry, engine }
 }
 
 function unresolved(reason: AutoLoadSkipReason): LastModelResolution {

@@ -11,7 +11,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ModelsScreen } from './ModelsScreen'
 import type { JevInfo, ModelEntry } from '../lib/types'
 
-const state: { models: ModelEntry[]; status: unknown } = { models: [], status: undefined }
+const state: { models: ModelEntry[]; status: unknown; sys?: unknown } = { models: [], status: undefined }
 const requestLoad = vi.fn()
 
 vi.mock('../lib/queries', () => ({
@@ -27,6 +27,7 @@ vi.mock('../lib/queries', () => ({
     eject: { mutate: vi.fn(), isPending: false },
   }),
   useStatus: () => ({ data: state.status ?? { engine: { state: 'stopped' }, model: null } }),
+  useSysInfo: () => ({ data: state.sys }),
 }))
 vi.mock('../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad, isPending: false, pendingKey: undefined }),
@@ -92,6 +93,7 @@ function renderScreen() {
 
 beforeEach(() => {
   state.status = undefined
+  state.sys = undefined
   state.models = [entry()]
   requestLoad.mockClear()
 })
@@ -238,5 +240,27 @@ describe('ModelsScreen — Jev models', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Load' }))
     expect(requestLoad).toHaveBeenCalledWith(entry())
     expect(requestLoad.mock.calls[0][0].jev).toBeUndefined()
+  })
+})
+
+describe('ModelsScreen — inside the Android app', () => {
+  it('offers importing model files, and says why, instead of a silently empty library', () => {
+    state.sys = { bundledEnginesOnly: true }
+    state.models = []
+    renderScreen()
+    expect(screen.getByText(/No models in the app yet/)).toBeTruthy()
+    expect(screen.getAllByRole('button', { name: /Import model file/ })).toHaveLength(1)
+  })
+
+  it('keeps the import button above a non-empty library', () => {
+    state.sys = { bundledEnginesOnly: true }
+    renderScreen()
+    expect(screen.getByText(/doesn.t let the app read model files in shared folders/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Import model file/ })).toBeTruthy()
+  })
+
+  it('shows no import control outside the app', () => {
+    renderScreen()
+    expect(screen.queryByRole('button', { name: /Import model file/ })).toBeNull()
   })
 })

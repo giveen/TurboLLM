@@ -5,6 +5,7 @@ import type { Engine } from '../config/config'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import { layaStatus } from './laya-status'
+import { engineInUse } from '../engines/serving'
 
 /** True while any slot is running or starting `entry` (matched by key or by path). */
 export function modelDeleteBlocked(d: Pick<Deps, 'manager' | 'modelRouter'>, entry: Pick<ModelEntry, 'key' | 'path'>): boolean {
@@ -19,7 +20,10 @@ export function modelDeleteBlocked(d: Pick<Deps, 'manager' | 'modelRouter'>, ent
  *  never active — while a Laya model is alive. */
 export function engineDeleteBlocked(d: Pick<Deps, 'manager' | 'modelRouter' | 'registry' | 'scanner'>, engine: Engine): boolean {
   if (engine.kind === 'laya') return layaStatus(d) !== null
-  if (engine.id !== d.registry.list().activeEngineId) return false
+  // An extra pool slot running on it (a .litertlm model auto-swapped into the pool runs on LiteRT-LM).
+  if (d.modelRouter.poolEngineIds().has(engine.id)) return true
+  // The active engine, or the one serving the primary model (a .litertlm model runs on LiteRT-LM whatever is active).
+  if (!engineInUse({ registry: d.registry, manager: d.manager }, engine.id)) return false
   const s = d.manager.status().state
   return s === 'running' || s === 'starting' || s === 'stopping'
 }
