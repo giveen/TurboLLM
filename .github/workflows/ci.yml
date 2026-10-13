@@ -36,18 +36,13 @@ jobs:
   # Expand-Archive instead of tar, `llama-server.exe`, a separate CUDA runtime pack), and until
   # this job existed none of that had ever been executed by CI — the win32-only tests were
   # simply skipped on the ubuntu runner, which is how a Windows-only regression reached review.
-  #
-  # continue-on-error: the suite has only ever run on Linux; landing it non-blocking first means
-  # it can be seen green (and any platform-specific failures fixed) before it gates PRs. Remove
-  # this line once the job is reliably green. As of the first run (2026-10-13) it reports 23
-  # failures, none of them in this branch's files: zip-install's Windows naming/permission
-  # assumptions (pickZipFiles/extractZipFiles/installZipEngine), the LiteRT-LM native tests
-  # (`spawn EFTYPE` on a POSIX fixture) and one shell-branch tool test. That Windows-parity work
-  # is its own change; this job is what makes it visible.
+  # Its first runs found 23 failing tests in modules that had never run there: zip-install's
+  # host-vs-archive binary naming and POSIX library names in a Windows fixture, the LiteRT-LM
+  # `#!` fixture Windows cannot execute, and a shell-refused argv path. Those are fixed, so this
+  # job gates like every other one now (no continue-on-error).
   test-windows:
     name: Typecheck & Unit tests (Windows)
     runs-on: windows-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v7
