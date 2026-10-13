@@ -85,7 +85,15 @@ const ANDROID_ENGINE_HF_URL = 'https://huggingface.co/mohitsoni48/turbollm-andro
 // CUDA toolkit line for Windows prebuilts (13.x is required for Blackwell / RTX 50xx).
 const CUDA_VER = '13.3'
 
-const serverBin = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
+/** The server binary name for a platform: upstream names its Windows build `llama-server.exe`
+ *  and every other build `llama-server`. Defaults to this daemon's OS. Take the platform as an
+ *  argument whenever the question is about an ARCHIVE's platform rather than the machine's — an
+ *  uploaded or downloaded zip can be for another OS (a Windows zip inspected on Linux, or the
+ *  reverse), and looking for one name while filtering for the other silently finds nothing. */
+export const serverBinNameFor = (platform: NodeJS.Platform = process.platform): string =>
+  platform === 'win32' ? 'llama-server.exe' : 'llama-server'
+
+const serverBin = serverBinNameFor()
 
 export type BackendId = 'cuda' | 'rocm' | 'sycl' | 'vulkan' | 'metal' | 'cpu'
 
