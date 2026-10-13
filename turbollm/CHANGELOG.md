@@ -23,7 +23,42 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **LiteRT-LM in the standalone Android app.** The app now ships LiteRT-LM built in: a native port of
+  `litert-lm serve` over the same `liblitert-lm.so` runtime Termux users run through Python, registered at boot
+  as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
+  existing LiteRT-LM config, warm-up and request handling apply unchanged; it is not updated from PyPI (it updates
+  with the app) and needs no Python preflight.
+- `.litertlm` models load on the LiteRT-LM engine whichever engine is active, the way Laya models go to Laya — no
+  engine switch needed first.
+- `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
+  bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
+  limited to GGUF repos while LiteRT-LM is the active engine.
+
+### Fixed
+- **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
+  runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
+  name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
+  prompt failed however Context was set. The scanner now reads the global KV caches' `maximum_sequence_length` from the
+  bundle header; the slider stops there and a larger saved Context is clamped at load. Every platform.
+- **Engine errors sent inside a stream reach the chat.** LiteRT-LM (and llama-server once streaming has begun) report a
+  failed turn as a `data: {"error": …}` chunk, which the chat skipped, ending the turn as an empty message. The error
+  is now shown, a non-OK engine response carries the engine's reason, and a LiteRT-LM context overflow says why.
+- **Requests are shaped for the engine actually serving the model.** A `.litertlm` model runs on LiteRT-LM whichever
+  engine is active, but chat, the gateway, routines, the extension API and the agents shaped requests (model field,
+  token limit) for the active engine. The last-used `.litertlm` model also resumes on LiteRT-LM at boot now.
+- **RAM usage counts the page cache as available** (MemAvailable, not Node 18's MemFree), which made Linux and
+  Android machines look nearly out of memory.
+- **Auto CPU threads use the performance cores on big.LITTLE arm64** (phones, Termux, ARM Linux), where threads on
+  efficiency cores slow every decode step. Other machines keep half the logical cores.
+- Android (app and Termux): the CPU name comes from the SoC, the core count includes cores outside the app's cpuset,
+  CPU usage falls back to TurboLLM's own processes where /proc/stat is closed to apps, and GPU load is read from the
+  kernel where the vendor lets apps read it.
+
+### Changed
+- The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
+  Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
+  Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.
 
 ## [1.14.5] - 2026-10-04
 

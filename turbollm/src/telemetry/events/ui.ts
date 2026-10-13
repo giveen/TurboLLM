@@ -539,7 +539,7 @@ export const UI_ACTIONS = [
   'switch_models_tab', 'filter_models', 'open_model_folders', 'rescan_models', 'toggle_incompatible_models',
   'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
   'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
-  'browse_model_dir', 'add_model_dir',
+  'browse_model_dir', 'add_model_dir', 'import_model_file',
 
   'switch_customize_tab', 'close_mcp_panel', 'connect_mcp_server', 'add_local_mcp_server',
   'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
@@ -592,6 +592,7 @@ export const UI_ACTIONS = [
   'browse_new_engine_folder', 'browse_new_engine_binary', 'cancel_add_engine',
   'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
   'upload_new_engine_zip', 'done_zip_engine_update',
+  'open_release_source', 'install_release_asset', 'update_release_engine', 'install_prebuilt_from_card',
 
   'back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill',
 

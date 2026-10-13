@@ -26,6 +26,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
     version: 'test',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dataDir },
     manager: {
+      currentOpts: () => null,
       status: () => ({
         state: err ? 'error' : 'running',
         err: err ?? null,

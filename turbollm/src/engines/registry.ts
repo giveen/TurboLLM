@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
 import { probe, type ProbeResult } from './probe'
+import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
 
@@ -71,7 +72,7 @@ export class Registry {
   async add(
     name: string,
     binPath: string,
-    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string },
+    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string; release?: ReleaseProvenance },
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
     this.assertNameFree(finalName, source)
@@ -80,6 +81,7 @@ export class Registry {
     const sourceBranch = source?.sourceBranch?.trim() || undefined
     const sourceCommit = source?.sourceCommit?.trim() || undefined
     const sourcePatchUrl = source?.sourcePatchUrl?.trim() || undefined
+    const release = source?.release
     const eng: Engine = {
       id: randomUUID(),
       name: finalName,
@@ -92,6 +94,7 @@ export class Registry {
       ...(sourceBranch ? { sourceBranch } : {}),
       ...(sourceCommit ? { sourceCommit } : {}),
       ...(sourcePatchUrl ? { sourcePatchUrl } : {}),
+      ...(release ? { release } : {}),
     }
     this.store.update((c) => {
       // Re-check under the store lock — the name could have been taken between the
@@ -275,6 +278,11 @@ export class Registry {
     return this.store.snapshot().engines.find((e) => e.kind === 'laya')
   }
 
+  /** The LiteRT-LM engine a .litertlm model loads on when the active engine is another kind (engineForModel). */
+  litertLmEngine(): Engine | undefined {
+    return this.store.snapshot().engines.find((e) => e.kind === 'litert-lm')
+  }
+
   /** Register a KoboldCpp engine (kind='koboldcpp'). binPath is the single KoboldCpp
    *  binary, not a llama-server, so llama.cpp capabilities/flags don't apply (it uses
    *  its own CLI flag names — see koboldcppProfileToArgs). */
@@ -360,6 +368,19 @@ export class Registry {
     return out!
   }
 
+  /** Replace the release-asset provenance of an existing engine (ADR-453), e.g. after an update
+   *  installed a newer tag of the same build variant. */
+  setRelease(id: string, release: ReleaseProvenance): Engine {
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const e = findEngine(c.engines, id)
+      if (!e) throw new NotFoundError()
+      e.release = release
+      out = structuredClone(e)
+    })
+    return out!
+  }
+
   remove(id: string): void {
     this.store.update((c) => {
       const i = c.engines.findIndex((e) => e.id === id)
@@ -427,17 +448,23 @@ export class Registry {
    *  persisted from a previous install is guaranteed stale the moment the app is
    *  reinstalled or auto-updated. Confirmed live: reinstalling over an existing engine
    *  registration reproduced exactly BUG-01's `spawn ... ENOENT`. */
-  async repairBinPath(id: string, binPath: string): Promise<Engine> {
+  async repairBinPath(id: string, binPath: string, version?: string): Promise<Engine> {
     const e = this.get(id)
     if (!e) throw new NotFoundError()
-    const pr = await probe(binPath)
+    // Only a llama-server can be probed with --version/--help. Every other kind (the app's bundled LiteRT-LM server
+    // among them) keeps the empty capabilities it was registered with and takes its version from the caller.
+    const pr = e.kind === 'llama-server' ? await probe(binPath) : null
     let out: Engine | undefined
     this.store.update((c) => {
       const ce = findEngine(c.engines, id)
       if (!ce) throw new NotFoundError()
       ce.binPath = binPath
-      ce.version = pr.version
-      ce.capabilities = pr.capabilities
+      if (pr) {
+        ce.version = pr.version
+        ce.capabilities = pr.capabilities
+      } else if (version) {
+        ce.version = version
+      }
       out = structuredClone(ce)
     })
     return out!
@@ -570,6 +597,16 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
  *  Laya model with no Laya engine installed gets the active engine, whose compat check refuses it with the reason
  *  (compat.ts NEEDS_LAYA). Free-standing, and asking for the Laya engine only for a Laya model, so every caller's
  *  registry needs nothing beyond active() for every other model. */
-export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
-  return (entry.laya && registry.layaEngine()) || registry.active()
+export function engineForModel(
+  registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'>,
+  entry: Pick<ModelEntry, 'laya'> & Partial<Pick<ModelEntry, 'format'>>,
+): Engine | undefined {
+  if (entry.laya) return registry.layaEngine() || registry.active()
+  // A .litertlm bundle runs on LiteRT-LM and nothing else (compat.engineAcceptsFormat), so when the active engine is
+  // another kind it would only ever fail with engine_model_mismatch. Route it to the registered LiteRT-LM engine the
+  // way a Laya model goes to Laya. This is what makes the Android app's bundled engine usable without first switching
+  // engines by hand: the app activates its llama.cpp engine, and every .litertlm model still has a home.
+  const active = registry.active()
+  if (entry.format === 'litertlm' && active?.kind !== 'litert-lm') return registry.litertLmEngine() || active
+  return active
 }

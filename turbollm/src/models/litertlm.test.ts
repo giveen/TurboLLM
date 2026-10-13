@@ -6,10 +6,12 @@ import {
   hasLitertlmMagic,
   isLitertlmFileName,
   litertlmEntryFor,
+  litertlmNativeCtxFromFile,
   litertlmNativeCtxFromName,
   litertlmQuantFromName,
 } from './litertlm'
 import { tmpDir } from '../test-support/tmp'
+import { fakeLitertlmBundle as fakeBundle } from '../test-support/litertlm-bundle'
 
 function scratch(t: TestContext): string {
   const dir = tmpDir('turbollm-litertlm-')
@@ -71,4 +73,53 @@ test('litertlmEntryFor builds a single-file, text-only library entry', () => {
 
 test('litertlmEntryFor flags an empty file as incomplete', () => {
   assert.equal(litertlmEntryFor('/m/a.litertlm', '/m', 0, 0).incomplete, true)
+})
+
+// ── context limit from the header ──────────────────────────────────────────────────────────
+
+test('litertlmNativeCtxFromFile: the global KV caches\' maximum_sequence_length is the limit, the smallest winning', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'LFM2.5-230M_int8.litertlm')
+  // A conv state (type 5, no length), a global key cache at 8192 and a global value cache at 4096.
+  writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 8192], [2, 4096]]))
+  assert.equal(await litertlmNativeCtxFromFile(p), 4096)
+})
+
+test('litertlmNativeCtxFromFile: a sliding-window cache\'s length is its window, not the context', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'gemma.litertlm')
+  writeFileSync(p, fakeBundle(32768, [[3, 512], [4, 512], [1, 32768], [2, 32768]]))
+  assert.equal(await litertlmNativeCtxFromFile(p), 32768)
+})
+
+test('litertlmNativeCtxFromFile: untyped caches count only when none is typed, and then the largest wins', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  // An older export: no types at all, a 512-token sliding window beside the 8192-token global caches.
+  const old = join(dir, 'old.litertlm')
+  writeFileSync(old, fakeBundle(0, [[0, 512], [0, 8192], [0, 8192]]))
+  assert.equal(await litertlmNativeCtxFromFile(old), 8192)
+  // Typed global caches present: untyped ones are ignored, even a shorter one.
+  const mixed = join(dir, 'mixed.litertlm')
+  writeFileSync(mixed, fakeBundle(0, [[0, 512], [1, 4096], [2, 4096]]))
+  assert.equal(await litertlmNativeCtxFromFile(mixed), 4096)
+})
+
+test('litertlmNativeCtxFromFile: no limit when no global cache declares one — LlmMetadata alone is only a default', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'm.litertlm')
+  writeFileSync(p, fakeBundle(32768, []))
+  assert.equal(await litertlmNativeCtxFromFile(p), 0)
+})
+
+test('litertlmNativeCtxFromFile: 0 for anything it cannot read', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'bad.litertlm')
+  writeFileSync(p, Buffer.from('LITERTLM garbage that is not a header'))
+  assert.equal(await litertlmNativeCtxFromFile(p), 0)
+  assert.equal(await litertlmNativeCtxFromFile(join(dir, 'missing.litertlm')), 0)
+})
+
+test('litertlmEntryFor: the header limit wins over the name tag, which stays the fallback', () => {
+  assert.equal(litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0, 4096).nativeCtx, 4096)
+  assert.equal(litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0).nativeCtx, 8192)
 })

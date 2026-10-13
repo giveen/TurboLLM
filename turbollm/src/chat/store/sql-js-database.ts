@@ -5,11 +5,14 @@
 //     non-graceful kill (routine on Android — the OS can kill an app any time) loses writes
 //     since the last flush, not since the last close — periodic flush (below) bounds that
 //     window instead of only flushing at a clean shutdown, which chat data on Android can't
-//     assume ever happens.
+//     assume ever happens. Each flush replaces the file atomically (temp + rename), so a
+//     kill mid-flush costs that interval's writes, never the whole file.
 //   • No WAL journal mode / busy_timeout — meaningless for an in-process, single-connection,
-//     single-threaded WASM database; both PRAGMAs are silently accepted as no-ops so
+//     single-threaded WASM database; both PRAGMAs are stripped out of exec() as no-ops so
 //     ConversationStore's migrate() doesn't need an Android-specific branch of its own.
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+//     foreign_keys is kept, and re-applied after every export() (which resets it).
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import initSqlJs, { type Database as SqlJsDb, type SqlJsStatic } from 'sql.js'
 import type { SqlDb, SqlStatement, SqlValue } from './sqlite-adapter.js'
 
@@ -54,34 +57,95 @@ function bindArgs(params: (SqlValue | Record<string, SqlValue>)[]): Record<strin
   return (params as SqlValue[]).map(toSqlJsValue)
 }
 
+/** fsyncs `path`'s parent directory so a rename over `path` survives a power loss or an OS
+ *  crash, not just a process kill: the file's own fsync covers its contents, never the
+ *  directory entry the rename created. Best-effort by design — Windows refuses to open a
+ *  directory this way, and the bytes are already safely in the file by then, so a failure here
+ *  must not turn a completed flush into a failed one. */
+function fsyncDirectory(path: string): void {
+  let dir: number | undefined
+  try {
+    dir = openSync(dirname(path), 'r')
+    fsyncSync(dir)
+  } catch {
+    /* unsupported here (Windows) — the rename is still atomic, just not crash-durable */
+  } finally {
+    if (dir !== undefined) closeSync(dir)
+  }
+}
+
 class SqlJsAdapter implements SqlDb {
   private readonly flushTimer: ReturnType<typeof setInterval>
   private closed = false
+  // Set by anything that may have written; cleared only by a successful flush, so an idle
+  // daemon doesn't rewrite the whole file every interval and a failed flush is retried.
+  private dirty = false
 
   constructor(private readonly db: SqlJsDb, private readonly path: string) {
     this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS)
     this.flushTimer.unref?.()
   }
 
+  /** Writes the snapshot to a sibling temp file, fsyncs it, then renames it over `path`, so
+   *  a kill mid-write leaves the previous snapshot intact instead of a truncated file (which
+   *  would fail to load and lose every conversation, not just the last interval's writes). */
   private flush(): void {
-    if (this.closed) return
+    if (this.closed || !this.dirty) return
+    const tmp = `${this.path}.tmp`
     try {
-      writeFileSync(this.path, Buffer.from(this.db.export()))
+      const bytes = this.exportPreservingForeignKeys()
+      const fd = openSync(tmp, 'w')
+      try {
+        writeFileSync(fd, bytes) // loops on short writes; a bare writeSync doesn't
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(tmp, this.path)
+      // Before `dirty` is cleared: the rename is what publishes the snapshot, and the
+      // directory entry it created is only durable once the directory itself is synced.
+      fsyncDirectory(this.path)
+      this.dirty = false
     } catch {
-      // Best-effort — the in-memory DB stays usable even if a flush fails (e.g. disk full).
+      // Best-effort — the in-memory DB stays usable even if a flush fails (e.g. disk full);
+      // `dirty` stays set so the next interval retries.
     }
   }
 
+  /** sql.js's export() closes and reopens the underlying connection, which resets
+   *  connection-scoped PRAGMAs — foreign_keys drops back to OFF, silently disabling the
+   *  schema's ON DELETE CASCADEs after the first flush. Restore it if it was on.
+   *
+   *  The re-apply is deliberately NOT in a `finally`: export() does `sqlite3_close_v2` before
+   *  reading the file back and re-opening it (sql.js's `exportDatabase`), so once it throws
+   *  there is no live handle to run this PRAGMA against, and running it anyway would throw a
+   *  second time and replace the error that actually failed the flush. */
+  private exportPreservingForeignKeys(): Uint8Array {
+    const fkOn = this.db.exec('PRAGMA foreign_keys')[0]?.values[0]?.[0] === 1
+    const bytes = this.db.export()
+    if (fkOn) this.db.exec('PRAGMA foreign_keys = ON')
+    return bytes
+  }
+
   exec(sql: string): void {
-    const trimmed = sql.trim().toLowerCase()
-    if (trimmed.startsWith('pragma journal_mode') || trimmed.startsWith('pragma busy_timeout')) return
-    this.db.exec(sql)
+    // Drop only the unsupported PRAGMA statements, not the whole string: ConversationStore's
+    // `PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = …` would
+    // otherwise lose its foreign_keys statement along with them.
+    const rest = sql.replace(/\bpragma\s+(?:journal_mode|busy_timeout)\b[^;]*;?/gi, '').trim()
+    if (!rest) return
+    this.db.exec(rest)
+    this.dirty = true
   }
 
   prepare(sql: string): SqlStatement {
     const db = this.db
+    const markDirty = () => { this.dirty = true }
+    // get()/all() are reads everywhere today, but a statement that isn't a plain SELECT
+    // (e.g. a future INSERT … RETURNING) must still be flushed.
+    const mayWrite = !/^\s*select\b/i.test(sql)
     return {
       get(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        if (mayWrite) markDirty()
         const stmt = db.prepare(sql)
         try {
           const bound = bindArgs(params)
@@ -95,6 +159,7 @@ class SqlJsAdapter implements SqlDb {
         }
       },
       all(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        if (mayWrite) markDirty()
         const stmt = db.prepare(sql)
         const rows: Record<string, unknown>[] = []
         try {
@@ -107,6 +172,7 @@ class SqlJsAdapter implements SqlDb {
         return rows
       },
       run(...params: SqlValue[] | [Record<string, SqlValue>]) {
+        markDirty()
         const stmt = db.prepare(sql)
         try {
           const bound = bindArgs(params)
@@ -122,9 +188,9 @@ class SqlJsAdapter implements SqlDb {
 
   close(): void {
     if (this.closed) return
-    this.closed = true
     clearInterval(this.flushTimer)
-    this.flush()
+    this.flush() // before `closed` is set — flush() is a no-op once it is
+    this.closed = true
     this.db.close()
   }
 }

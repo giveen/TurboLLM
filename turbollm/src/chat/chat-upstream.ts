@@ -24,6 +24,7 @@ import { linkHeaders, proxyStream, type RemoteTarget } from '../link/link-proxy'
 import type { Deps } from '../deps'
 import { isTextClassifier } from '../models/text-classifier'
 import { extractParams, summarizeRequest, drainOpenAiSseForLog, requestLogConfig } from '../observability/request-log'
+import { servingEngineKind } from '../engines/serving'
 
 /** Everything a chat turn needs to know about where it is being generated. */
 export interface ChatUpstream {
@@ -109,7 +110,7 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
   if (!target) {
     return { ok: false, status: 409, code: 'model_not_loaded', message: 'Engine not running.' }
   }
-  const engineKind = d.registry.active()?.kind ?? ''
+  const engineKind = servingEngineKind(d)
   return {
     ok: true,
     upstream: {

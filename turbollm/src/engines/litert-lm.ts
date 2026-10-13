@@ -27,7 +27,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { execFile } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
@@ -122,7 +122,7 @@ export function pickAndroidWheel(files: PypiFile[], abi: string): PypiFile | nul
 /** Termux hint shared by every "no usable Python" failure. */
 const ANDROID_PYTHON_HINT =
   'LiteRT-LM on Android needs Python 3.10 or newer from Termux (run `pkg install python`) with TurboLLM started ' +
-  'from Termux. The standalone Android app has no Python and cannot run this engine.'
+  'from Termux. The standalone Android app needs none of this: it ships LiteRT-LM built in.'
 
 /** A python>=3.10 with the venv module on this device, or throws with the Termux instructions. */
 async function findAndroidPython(): Promise<string> {
@@ -397,11 +397,13 @@ export interface LitertLmConfig {
  * cpu or gpu outright; `auto` (the default) follows the KoboldCpp convention: `ngl > 0` on a machine with a GPU means
  * the GPU backend and everything else means CPU.
  *   ctx     → max_num_tokens   (the KV-cache length; a bundle exported with a shorter one still caps it)
- *   threads → cpu_thread_count (only when set; 0 = let the runtime choose)
+ *   threads → cpu_thread_count (when set; 0 = `autoThreads` if given — the performance cores on a phone, where the
+ *             runtime's own fixed default can land threads on efficiency cores — else the runtime chooses)
  */
 export function litertLmProfileToConfig(
   p: { ctx: number; ngl: number; threads: number; litertLm?: { backend?: 'auto' | 'cpu' | 'gpu' } },
   hasGpu: boolean,
+  autoThreads = 0,
 ): LitertLmConfig {
   // An explicit choice wins over detection: Android/Termux cannot report a GPU, so `auto` would pin it to CPU.
   const choice = p.litertLm?.backend ?? 'auto'
@@ -409,6 +411,7 @@ export function litertLmProfileToConfig(
   const config: LitertLmConfig = { default: { backend } }
   if (Number.isInteger(p.ctx) && p.ctx > 0) config.default.max_num_tokens = p.ctx
   if (Number.isInteger(p.threads) && p.threads > 0) config.default.cpu_thread_count = p.threads
+  else if (Number.isInteger(autoThreads) && autoThreads > 0) config.default.cpu_thread_count = autoThreads
   return config
 }
 
@@ -449,10 +452,36 @@ export function litertLmServerCommand(
   host: string,
   extraArgs: string[] = [],
 ): { cmd: string; args: string[] } {
-  return {
-    cmd: python,
-    args: ['-m', 'litert_lm_cli.main', 'serve', '--config', configPath, '--host', host, '--port', String(port), ...extraArgs],
-  }
+  const serve = ['serve', '--config', configPath, '--host', host, '--port', String(port), ...extraArgs]
+  // The Android app's bundled server takes the CLI's own `serve` arguments, so only the program differs.
+  if (isNativeLitertLm(python)) return { cmd: python, args: serve }
+  return { cmd: python, args: ['-m', 'litert_lm_cli.main', ...serve] }
+}
+
+/**
+ * The standalone Android app's LiteRT-LM engine: a native port of `litert-lm serve` (TurboLLM-Android,
+ * engines/litert-lm-server) that drives the same liblitert-lm.so the Python server reaches through ctypes. The app has
+ * no Python and may only execute files installed with its APK, so it ships this server in its nativeLibraryDir under
+ * a lib*.so name, where seed.ts registers it. It speaks the same contract as `serve` — `--config/--host/--port`, the
+ * model path in each request's `model` field, the runtime's message in a failed request's status line — so everything
+ * else about the litert-lm kind (config file, warm-up, compat) applies unchanged. What differs is only what follows
+ * from it not being Python: no venv preflight, no pip updates, the native library environment.
+ */
+export const LITERT_LM_NATIVE_SERVER = 'liblitertlm_server.so'
+
+/** Whether a litert-lm engine's binPath is the bundled native server rather than a venv's python. */
+export function isNativeLitertLm(binPath: string): boolean {
+  return basename(binPath) === LITERT_LM_NATIVE_SERVER
+}
+
+/** The engine version for the native server, from its `--version` line
+ *  ("turbollm-litertlm-server 1.0.0 (LiteRT-LM 0.18.0)") in the pip-style form the litert-lm kind stores
+ *  ("litert-lm 0.18.0"). `--version` returns before the runtime library is loaded, so this is instant. */
+export async function litertLmNativeVersion(binPath: string): Promise<string> {
+  // 5 s: it runs at every boot of the app, where a hung probe would hold up engine registration.
+  const { stdout } = await execFileP(binPath, ['--version'], { timeout: 5_000 })
+  const m = /LiteRT-LM\s+([\w.+-]+)/.exec(stdout)
+  return `litert-lm ${m ? m[1] : stdout.trim() || 'unknown'}`
 }
 
 export type LitertLmWarmUp = { ok: true } | { ok: false; message: string }
@@ -482,6 +511,17 @@ export async function warmUpLitertLm(port: number, modelRef: string, signal: Abo
   } catch (e) {
     return { ok: false, message: e instanceof Error ? e.message : String(e) }
   }
+}
+
+/** A runtime error from a LiteRT-LM turn, with the likely fix when it is the context limit. A .litertlm bundle is
+ *  exported with a fixed maximum sequence length, and raising Context on the load panel cannot go past it, so a long
+ *  system prompt (the TurboLLM Expert persona alone is ~15k tokens) fails on small bundles however Context is set. */
+export function litertLmTurnErrorMessage(reason: string): string {
+  // The runtime's wording (tasks.cc): "Input token ids are too long. Exceeding the maximum number of tokens allowed".
+  if (!/token ids are too long|maximum number of tokens|max_num_tokens/i.test(reason)) return reason
+  return `${reason}. The prompt is longer than this model can take: a LiteRT-LM bundle has a fixed maximum length set ` +
+    'when it was exported, and the Context setting cannot raise it. Use a shorter system prompt (the Lite persona), ' +
+    'start a new chat, or use a model exported with a longer context.'
 }
 
 /** The user-facing text for a failed warm-up: the runtime's message plus the two causes that account for most of them. */

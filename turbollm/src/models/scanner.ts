@@ -8,7 +8,7 @@ import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
-import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor } from './litertlm'
+import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmNativeCtxFromFile } from './litertlm'
 
 export interface ModelEntry {
   key: string
@@ -381,7 +381,8 @@ export class Scanner {
     const gguf = await this.build(scan.ggufs)
     const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
     const laya = scan.layaDirs.map((dir) => layaEntryFor(dir))
-    const litertlm = scan.litertlms.map((f) => litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime))
+    const litertlm = await Promise.all(scan.litertlms.map(async (f) =>
+      litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmNativeCtxFromFile(f.path))))
     this.entries = [...gguf, ...mlx, ...laya, ...litertlm].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
     this.saveCache()

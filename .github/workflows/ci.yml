@@ -12,9 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -36,6 +36,84 @@ jobs:
         run: npm test
         working-directory: turbollm
 
+  web:
+    name: Web build & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            turbollm/package-lock.json
+            turbollm/web/package-lock.json
+
+      # web/'s tsconfig resolves @types/node from turbollm/node_modules (web/ declares
+      # none itself), exactly as the release builds run it — so install turbollm first.
+      - name: Install daemon dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: turbollm/web
+
+      - name: Typecheck & build
+        run: npm run build
+        working-directory: turbollm/web
+
+      - name: Unit tests
+        run: npm test
+        working-directory: turbollm/web
+
+  # tsup.android.config.ts is a separate build pass whose only consumer is the APK, and
+  # nothing in CI built it: the regression it fixes (bundling `puppeteer-core` dragged
+  # @puppeteer/browsers' yargs in, whose ESM shim redeclares `__dirname` and made the phone
+  # crash at boot) would have shipped unnoticed a second time. Runs on ubuntu because the
+  # check is about the bundle's CONTENT, not about running it — the phone's Node 18 runtime
+  # can't be reproduced here.
+  android-bundle:
+    name: Android bundle build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Build the Android bundle
+        run: npx tsup --config tsup.android.config.ts
+        working-directory: turbollm
+
+      # Catches an ESM syntax error in an emitted chunk (the `__dirname` collision above was
+      # one). It says nothing about the phone's older runtime: this is the CI host's node.
+      - name: Every emitted chunk parses
+        run: |
+          for f in dist-android/*.js; do
+            node --check "$f" || exit 1
+          done
+        working-directory: turbollm
+
+      # The Code feature is cut from Android entirely; these chunks only appear when
+      # something drags its dependency chain back in (verified by removing the `noExternal`
+      # lookahead: puppeteer-core-*.js, bidi-*.js and yargs-*.js all reappear).
+      - name: The Code feature's chunks stay out of the bundle
+        run: |
+          if ls -1 dist-android | grep -Eq 'puppeteer-core|bidi|yargs'; then
+            echo "::error::the Android bundle contains Code-feature chunks"
+            ls -1 dist-android
+            exit 1
+          fi
+        working-directory: turbollm
+
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}
@@ -43,8 +121,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: '22' }
       - run: npm test
         working-directory: wrapper

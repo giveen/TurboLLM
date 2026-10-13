@@ -2,11 +2,14 @@
 // GPU vendor, downloads the fastest llama.cpp backend it supports, and registers
 // it — trying the recommended backend, then Vulkan, then CPU if one won't probe.
 // No-ops if any engine is already configured. Never throws.
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Registry } from './registry'
+import type { ConfigStore } from '../config/config'
 import type { ProvisionState } from './provision-state'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
+import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
 import { LLAMA_BUILD, fallbackChain, provisionBackend, recommendBackendId, type BackendId, type ProvisionProgress } from './download'
 
 const VALID_BACKENDS: BackendId[] = ['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu']
@@ -34,6 +37,11 @@ const ANDROID_ENGINE_NAME = 'llama-server-android'
  *  engine instead of logging a failure for something that was never shipped. */
 const ANDROID_VULKAN_ENGINE_NAME = 'llama-server-android-vulkan'
 
+/** The app's bundled LiteRT-LM engine: the native port of `litert-lm serve` that TurboLLM-Android ships beside
+ *  liblitert-lm.so (litert-lm.ts, LITERT_LM_NATIVE_SERVER). Registered only when the APK carries it, like the Vulkan
+ *  engine. It never needs activating: .litertlm models are routed to it whatever engine is active (engineForModel). */
+const ANDROID_LITERT_LM_ENGINE_NAME = 'litert-lm-android'
+
 /** BUG-01 fix (QA_BUGS.md): on Android, the llama-server binary bundled inside the APK
  *  lives at `<nativeLibraryDir>/libllama_server.so` — the only on-disk location Android's
  *  W^X hardening exempts from execve() (build.gradle.kts's jniLibs comment). Nothing in
@@ -55,19 +63,36 @@ export async function ensureAndroidBundledEngine(registry: Registry): Promise<vo
   const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (!nativeLibDir) return
 
-  const bundled: { name: string; file: string; required: boolean }[] = [
-    { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', required: true },
-    { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', required: false },
+  const bundled: { name: string; file: string; required: boolean; kind: 'llama-server' | 'litert-lm' }[] = [
+    { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', required: true, kind: 'llama-server' },
+    { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', required: false, kind: 'llama-server' },
+    { name: ANDROID_LITERT_LM_ENGINE_NAME, file: LITERT_LM_NATIVE_SERVER, required: false, kind: 'litert-lm' },
   ]
 
-  for (const { name, file, required } of bundled) {
+  for (const { name, file, required, kind } of bundled) {
     const binPath = join(nativeLibDir, file)
     // Optional engines are skipped silently when absent: "this APK didn't ship the Vulkan
     // binary" is a build configuration, not a fault worth a warning on every boot.
     if (!required && !existsSync(binPath)) continue
     try {
       const existing = registry.list().engines.find((e) => e.name === name)
-      if (!existing) {
+      if (kind === 'litert-lm') {
+        // Not a llama-server, so no probe: the version comes from the server's own --version, and it is
+        // refreshed on every boot because an app update can ship a newer runtime at the same path.
+        // A failed --version must not cost the engine: it ships in the APK, so register it regardless and say why.
+        // A version already on record is kept over the placeholder: one failed probe must not erase a real one.
+        const version = await litertLmNativeVersion(binPath).catch((err) => {
+          console.warn(`android: ${name} --version failed (${err instanceof Error ? err.message : err}); registering anyway`)
+          return existing?.version || 'litert-lm (bundled)'
+        })
+        if (!existing) {
+          registry.addLitertLm(name, binPath, version)
+          console.log(`android: registered bundled engine ${name} (${version}) at ${binPath}`)
+        } else if (existing.binPath !== binPath || existing.version !== version) {
+          await registry.repairBinPath(existing.id, binPath, version)
+          console.log(`android: refreshed bundled engine ${name} (${version}) at ${binPath}`)
+        }
+      } else if (!existing) {
         await registry.add(name, binPath)
         console.log(`android: registered bundled engine ${name} at ${binPath}`)
       } else if (existing.binPath !== binPath) {
@@ -150,4 +175,22 @@ export async function seedDefaultEngines(
   // real-world case) the download succeeding but the binary failing its post-download probe.
   provision.fail(`Could not download a default engine.${lastError ? ` [${lastError}]` : ' Check your connection or add one manually.'}`)
   console.warn('seed: could not provision a default engine — add one manually in Settings.')
+}
+
+/** The packaged Android app imports models into `<HOME>/models` (TurboLLM-Android ModelImport.kt; HOME is the app's
+ *  files dir), so that folder is always one of the model folders there, added before the first scan. The app also
+ *  registers it after an import, but that request can fail (the daemon still starting at first launch), and the
+ *  imported models must not then sit in an unscanned folder. A no-op outside the packaged app, Termux included. */
+export function ensureAndroidModelsDir(store: Pick<ConfigStore, 'snapshot' | 'update'>, env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.TURBOLLM_ANDROID_NATIVE_LIB_DIR) return
+  const dir = join(homedir(), 'models')
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    return
+  }
+  if (store.snapshot().modelDirs.includes(dir)) return
+  store.update((cfg) => {
+    if (!cfg.modelDirs.includes(dir)) cfg.modelDirs.push(dir)
+  })
 }

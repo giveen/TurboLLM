@@ -3,7 +3,7 @@
 // productizes the hand-tuned models.json knowledge.
 import type { Capabilities, ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
-import type { SysInfo } from '../sysinfo/sysinfo'
+import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
 import { jevLaunchArgs, jevMaxModelLen, type JevInfo } from './jev'
 
@@ -876,8 +876,8 @@ export function profileToArgs(
   // for a bigger model / longer context at the cost of speed. `kvOffload` is absent on
   // pre-feature saved profiles → `=== false` treats that as the GPU default (no flag).
   if (p.kvOffload === false && has('--no-kv-offload')) a.push('--no-kv-offload')
-  // threads 0 = auto → half the logical cores (matches the UI's "Auto" label).
-  const threads = p.threads > 0 ? p.threads : cores > 0 ? Math.max(1, Math.floor(cores / 2)) : 0
+  // threads 0 = auto → the performance cores on a big.LITTLE CPU, else half the logical cores (autoThreadCount).
+  const threads = p.threads > 0 ? p.threads : autoThreadCount({ cores, perfCores: sys?.perfCores })
   if (threads > 0) a.push('--threads', String(threads))
   if (p.threadsBatch > 0) a.push('--threads-batch', String(p.threadsBatch))
   if (p.batchSize && p.batchSize > 0 && has('--batch-size')) a.push('--batch-size', String(p.batchSize))

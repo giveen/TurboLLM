@@ -243,6 +243,39 @@ export class ModelRouter {
     return true
   }
 
+  /** Ids of the engines the extra pool slots run on (not the primary). A .litertlm model auto-swapped into a slot
+   *  runs on LiteRT-LM whatever engine is active, so an engine can be in use without being active or primary. */
+  poolEngineIds(): Set<string> {
+    const ids = new Set<string>()
+    for (const slot of this.extraSlots.values()) {
+      const id = slot.manager.currentOpts()?.engine.id
+      if (id) ids.add(id)
+    }
+    return ids
+  }
+
+  /** How many extra pool slots run on `engineId` (read-only). A release update refuses to replace that engine's
+   *  files while this is above zero, rather than stopping a model the user is using. */
+  poolSlotsOnEngine(engineId: string): number {
+    let count = 0
+    for (const slot of this.extraSlots.values()) {
+      if (slot.manager.currentOpts()?.engine.id === engineId) count++
+    }
+    return count
+  }
+
+  /** Stop and drop every extra pool slot running on `engineId`, resolving once they have exited — before that
+   *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers). */
+  async stopPoolSlotsOnEngine(engineId: string): Promise<void> {
+    const stopping: Promise<unknown>[] = []
+    for (const [key, slot] of this.extraSlots) {
+      if (slot.manager.currentOpts()?.engine.id !== engineId) continue
+      this.extraSlots.delete(key)
+      stopping.push(slot.manager.stopAndWait())
+    }
+    await Promise.all(stopping)
+  }
+
   /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
    *  extra pool slot — so unlike `doLoad()`'s own bookkeeping, only `primaryLastUsed` needs
    *  updating on success. Without this, a manual switch left the router's own LRU timestamp

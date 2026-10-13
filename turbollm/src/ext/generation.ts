@@ -56,6 +56,7 @@ import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
+import { servingEngineKind } from '../engines/serving'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER / chat-runner.ts's identical constant — a
  *  ceiling, not a target. Ordinary chats finish in 1 round; this only bounds a runaway loop. */
@@ -261,7 +262,7 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
   }
   const loadedModel = ms.model
 
-  const engineKind = d.registry.active()?.kind ?? ''
+  const engineKind = servingEngineKind(d)
   // BUG-006 (chat-routes.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
   // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason.
   const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
